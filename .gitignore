@@ -1,0 +1,20 @@
+# Zugangsdaten - niemals einchecken
+deepl_key.txt
+azure_key.txt
+*.key
+.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Laufzeitdateien
+*.log
+log.txt*
+erstlauf*.txt
+*.lock
+*.tmp
+*.part
+sub_translate_state*.json

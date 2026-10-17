@@ -1,0 +1,5 @@
+srt
+requests
+pillow          # für OCR von Bild-Untertiteln (PGS)
+# Optional, nur als letzte Rückfallebene (groß, lädt Sprachmodelle nach):
+# argostranslate
