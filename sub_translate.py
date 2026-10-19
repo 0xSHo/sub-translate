@@ -505,8 +505,11 @@ def probe_subs(video):
          "-show_entries",
          "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired",
          "-of", "json", str(video)],
-        capture_output=True, text=True, check=True, creationflags=NO_WINDOW,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        check=True, creationflags=NO_WINDOW,
     ).stdout
+    if not out:
+        raise RuntimeError(f"ffprobe lieferte keine Ausgabe für {video.name}")
     return json.loads(out).get("streams", [])
 
 
@@ -690,7 +693,8 @@ class OCR:
         self.exe = exe
         self.german = german
         try:
-            out = subprocess.run([exe, "--list-langs"], capture_output=True, text=True, timeout=30,
+            out = subprocess.run([exe, "--list-langs"], capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=30,
                                  creationflags=NO_WINDOW)
             self.langs = set((out.stdout + out.stderr).split()[1:]) if out.returncode == 0 else set()
         except Exception:
@@ -976,7 +980,7 @@ def gpu_busy_reason(threshold):
     for _ in range(3):
         try:
             out = subprocess.run([exe, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                                 capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW).stdout
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=NO_WINDOW).stdout
             values.append(max(int(x) for x in out.split()))
         except Exception:
             return None
@@ -1227,6 +1231,30 @@ def scan(root, backends, state, min_age, min_size, prefer_sdh=False, gate=None, 
     return changed
 
 
+_instance_lock = None
+
+
+def single_instance(path):
+    """Verhindert eine zweite gleichzeitige Instanz im Dauerbetrieb. Die Sperre gibt das
+    Betriebssystem automatisch frei, wenn der Prozess endet (auch bei Absturz)."""
+    global _instance_lock
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _instance_lock = f  # offen halten, solange das Skript läuft
+    return True
+
+
 def read_secret(env_name, file_name):
     """Wert aus Umgebungsvariable oder aus einer Datei neben dem Skript (eine Zeile pro Wert)."""
     val = os.environ.get(env_name, "").strip()
@@ -1350,6 +1378,9 @@ def main():
                 hint = " Meintest du: " + ", ".join(str(parent / n) for n in near)
         log.error("Pfad nicht gefunden: %s.%s", args.folder, hint)
         raise SystemExit(1)
+    if args.watch and not single_instance(args.state.with_name("sub_translate.watch.lock")):
+        log.warning("Dauerbetrieb läuft bereits in einem anderen Prozess, diese Instanz beendet sich.")
+        raise SystemExit(0)
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             hint = "winget install Gyan.FFmpeg" if os.name == "nt" else "sudo apt install ffmpeg"
