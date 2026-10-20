@@ -100,7 +100,20 @@ Get-Content .\log.txt -Tail 30 -Encoding UTF8 -Wait
 
 Die Aufgabe startet bei jeder Anmeldung, läuft ohne Fenster und ohne Zeitlimit. Für das Ziel besser den Netzwerkpfad (`\\SERVER\...`) als einen Laufwerksbuchstaben verwenden, denn verbundene Laufwerke sind für geplante Aufgaben nicht immer sichtbar.
 
-**Nach einem Update:** `Stop-ScheduledTask SubTranslate`, `git pull`, `Start-ScheduledTask SubTranslate`.
+**Neustart, z. B. nach einem Update:** `Stop-ScheduledTask` beendet nur den Starter der Python-Umgebung, das Skript selbst läuft weiter. Deshalb zusätzlich den Prozess beenden:
+
+```powershell
+Stop-ScheduledTask -TaskName SubTranslate
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+  Where-Object CommandLine -like "*sub_translate*" |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+git pull                                   # bei Updates
+Start-ScheduledTask -TaskName SubTranslate
+```
+
+Startet versehentlich eine zweite Instanz, beendet sie sich selbst mit „Dauerbetrieb läuft bereits …“.
+
+**Anderer Ordner:** Das Skript enthält keinen festen Pfad. Es reicht, `install_task.ps1` mit dem neuen `-Watch` erneut auszuführen und danach wie oben neu zu starten. Ist der Ordner beim Start noch nicht da (z. B. externes Laufwerk), wartet das Skript darauf.
 
 ## Wichtige Optionen
 
