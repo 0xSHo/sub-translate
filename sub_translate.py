@@ -1368,6 +1368,12 @@ def main():
         handlers.append(logging.NullHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if args.watch and not args.folder.exists():
+        # Dauerbetrieb: auf den Ordner warten (z. B. externes Laufwerk noch nicht angeschlossen)
+        log.warning("Ordner %s nicht vorhanden, warte darauf (Prüfung alle %d s) ...", args.folder, args.interval)
+        while not args.folder.exists():
+            time.sleep(args.interval)
+        log.info("Ordner %s ist jetzt da.", args.folder)
     if not args.folder.exists():
         hint = ""
         parent = args.folder.parent
