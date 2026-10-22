@@ -176,15 +176,45 @@ def clean_single(text, src_line):
 COMPACT_SCRIPTS = {"zh", "ja", "ko", "th"}   # Schriften, die viel kompakter als Deutsch sind
 
 
-def incomplete(src_line, de_line, lang):
-    """Deutsche Übersetzung auffällig kurz -> vermutlich abgeschnitten.
-    Deutsch ist fast immer mindestens so lang wie Englisch/Französisch/Spanisch usw."""
+_SENT_END = re.compile(r"[.?!…]['\"”»’)\]]*\s*$")
+
+
+def _ends_sentence(line):
+    return bool(_SENT_END.search(re.sub(r"<[^>]+>|[%s]" % NOTES, "", line).strip()))
+
+
+def _text_len(t):
+    """Länge ohne Tags, Sprechernamen/Geräusche in Klammern, Notensymbole und Leerzeichen."""
+    t = re.sub(r"<[^>]+>", "", t)
+    t = re.sub(r"\([^)]*\)|\[[^\]]*\]", "", t)
+    return len(re.sub(r"[\s%s]" % NOTES, "", t))
+
+
+def sentence_problem(src, out, lang, prev_line=None):
+    """Prüft ganze Sätze statt einzelner Einblendungen: Ein Satz darf sich im Deutschen anders auf
+    seine Einblendungen verteilen, aber in der Summe darf nichts fehlen. Liefert (Original, Deutsch)
+    des ersten auffälligen Satzes oder None. Sätze, die am Abschnittsrand angeschnitten sind, werden
+    nicht bewertet (ihr Rest liegt im Nachbarabschnitt)."""
     if lang in COMPACT_SCRIPTS:
-        return False
-    s_, d = _plain_len(src_line), _plain_len(de_line)
-    if s_ < 18 or re.fullmatch(r"\s*(\([^)]*\)|\[[^\]]*\])\s*", re.sub(r"<[^>]+>", "", src_line)):
-        return False
-    return d < 0.6 * s_
+        return None
+    groups, start = [], 0
+    first_ok = prev_line is None or _ends_sentence(prev_line)
+    for i, line in enumerate(src):
+        if _ends_sentence(line):
+            if start > 0 or first_ok:
+                groups.append((start, i))
+            start = i + 1
+    for a, b in groups:
+        s_ = sum(_text_len(x) for x in src[a:b + 1])
+        d = sum(_text_len(x) for x in out[a:b + 1])
+        if s_ >= 18 and d < 0.6 * s_:
+            return " / ".join(src[a:b + 1]), " / ".join(out[a:b + 1])
+    return None
+
+
+def incomplete(src_line, de_line, lang, prev_line=None):
+    """Einzelne Zeile nur bewerten, wenn sie ein vollständiger Satz ist."""
+    return sentence_problem([src_line], [de_line], lang, prev_line) is not None
 
 
 def _plain_len(t):
@@ -336,11 +366,10 @@ class Ollama:
         system = (
             f"You translate film subtitles from {lang} into natural, idiomatic German as used in "
             "professional German subtitles. You get ONE subtitle line plus neighbouring lines for context. "
-            "Translate that one line COMPLETELY and by its meaning (not word for word): every piece of "
-            "information in the line must appear in the German, nothing may be left out or cut off. Use the "
-            "context lines only to understand who speaks and what is meant; do not translate them. If the "
-            "line continues a sentence from the previous line or into the next one, translate this line's "
-            "part so it reads naturally in German. Use natural spoken German (du/Sie fitting the situation). "
+            "Translate that one line by its meaning (not word for word) in natural spoken German (du/Sie "
+            "fitting the situation); nothing of the line may be left out. Use the context lines only to "
+            "understand who speaks and what is meant; do not translate them. If the line is only part of a "
+            "sentence, translate this part so the German reads naturally together with the other lines. "
             "Keep HTML tags like <i>...</i>, music symbols like ♪ and line breaks. Reply with the German "
             "translation only: no quotes, no notes, no explanations."
         )
@@ -357,7 +386,7 @@ class Ollama:
                         "num_predict": min(400, 40 + 2 * len(line))},
         }
         out = clean_single(self._post(body), line)
-        if out and incomplete(line, out, src):
+        if out and incomplete(line, out, src, context[-1] if context else None):
             log.info("    Ollama: Übersetzung unvollständig, frage neu (%r -> %r)", line[:40], out[:40])
             body["messages"].append({"role": "assistant", "content": out})
             body["messages"].append({"role": "user", "content":
@@ -381,12 +410,11 @@ class Ollama:
             "Each key holds an object with two fields: 'src' = the first three words of THAT key's line "
             "copied character by character in the ORIGINAL language (do NOT translate 'src'; for languages "
             "without spaces: its first 5 characters), and 'de' = the German translation of THAT key's line.\n"
-            "- Each key is shown on screen at its own fixed time. Translate EVERY key COMPLETELY and by its "
-            "meaning (not word for word): every piece of information in that key's line must appear in its "
-            "German text, nothing may be left out or cut off. NEVER move words, names or meaning into a "
-            "neighbouring key. If a sentence continues over several keys, translate each key's part so it "
-            "reads naturally. Never leave a key empty.\n"
-            "- Use natural spoken German (du/Sie fitting the situation).\n"
+            "- Each key is shown on screen at its own fixed time. Translate by meaning, in natural spoken "
+            "German (du/Sie fitting the situation). If a sentence runs over several keys, distribute the German "
+            "sentence naturally over exactly those keys (German word order may shift words between them), "
+            "but NEVER move anything into a key that belongs to a different sentence. The complete meaning "
+            "of every sentence must be there: nothing may be left out. Never leave a key empty.\n"
             "- Keep HTML tags like <i>...</i> and music symbols like ♪ where they are.\n"
             "- Keep line breaks inside an item if sensible; keep it short and readable.\n"
             "- 'context_before' and 'context_after' show the neighbouring lines ONLY for understanding. "
@@ -452,15 +480,15 @@ class Ollama:
             log.info("    Ollama: Zeile %d enthält den Anfang von Zeile %d (verschoben), frage neu (%r)",
                      i + 1, j + 1, echoes[i][:30])
             return None
-        short = next((i for i, (s_, o) in enumerate(zip(lines, out)) if incomplete(s_, o, src)), None)
-        if short is not None:
-            log.info("    Ollama: Zeile %d unvollständig übersetzt, frage neu (%r -> %r)",
-                     short + 1, lines[short][:40], out[short][:40])
-            return None
         odd = shifted(lines, out) if len(lines) > 1 else None
         if odd:
             log.info("    Ollama: Länge auffällig, Text evtl. verschoben, frage neu (%r -> %r)",
                      odd[0][:40], odd[1][:40])
+            return None
+        # Bei einer Einzelzeile lieber eine knappe Übersetzung behalten als gar keine
+        prob = sentence_problem(lines, out, src, context[-1] if context else None) if len(lines) > 1 else None
+        if prob:
+            log.info("    Ollama: Satz unvollständig übersetzt, frage neu (%r -> %r)", prob[0][:50], prob[1][:50])
             return None
         return out
 
