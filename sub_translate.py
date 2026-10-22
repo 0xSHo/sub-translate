@@ -521,6 +521,16 @@ def is_forced(s):
     return bool((s.get("disposition") or {}).get("forced")) or "forced" in title
 
 
+def special_rank(s):
+    """Kommentar-Spuren (2) und reine Schilder/Lieder-Spuren (1) nur nehmen, wenn nichts anderes da ist."""
+    title = ((s.get("tags") or {}).get("title", "")).lower()
+    if re.search(r"comment|kommentar|director|regie", title):
+        return 2
+    if re.search(r"\bsigns?\b|\bsongs?\b|lyrics|schilder", title):
+        return 1
+    return 0
+
+
 def is_sdh(s):
     title = ((s.get("tags") or {}).get("title", "")).lower()
     return bool((s.get("disposition") or {}).get("hearing_impaired")) or "sdh" in title
@@ -586,7 +596,7 @@ def pick_track(streams, prefer_sdh=False):
         lang = lang_of_stream(s)
         lang_rank = 0 if lang == "en" else (1 if lang else 2)  # Englisch, andere, unbekannt
         sdh_rank = (not is_sdh(s)) if prefer_sdh else is_sdh(s)
-        return lang_rank, sdh_rank, s["index"]
+        return special_rank(s), lang_rank, sdh_rank, s["index"]
 
     best = sorted(text, key=rank)[0]
     return best, lang_of_stream(best), None
@@ -912,13 +922,13 @@ def compare(video, prefer_sdh=False, ocr=None):
         raise SystemExit(f"Keine deutsche Untertiteldatei gefunden: {de_path}")
     de = list(srt.parse(read_text_guess(de_path)))
     with tempfile.TemporaryDirectory() as tmp:
-        src, lang = external_srt(video)
+        streams = probe_subs(video)
+        track, lang, reason = pick_track(streams, prefer_sdh)
+        src, _ = (None, None) if track is not None or reason == GERMAN_REASON else external_srt(video)
         if src:
             what = f"externe Datei {src.name}"
             orig = list(srt.parse(read_text_guess(src)))
         else:
-            streams = probe_subs(video)
-            track, lang, reason = pick_track(streams, prefer_sdh)
             if track is not None:
                 what = f"Spur {track['index']} ({lang or 'unbekannt'})"
                 p = Path(tmp) / "src.srt"
@@ -933,7 +943,7 @@ def compare(video, prefer_sdh=False, ocr=None):
                 raise SystemExit(f"Keine Originalspur zum Vergleichen: {reason}")
         all_tracks = [f"{s_['index']}: {lang_of_stream(s_) or '?'} {s_.get('codec_name')}"
                       f"{' SDH' if is_sdh(s_) else ''}{' forced' if is_forced(s_) else ''}"
-                      for s_ in (probe_subs(video) if not src else [])]
+                      for s_ in streams]
 
     def ts(t):
         t = int(t.total_seconds() * 1000)
@@ -972,12 +982,15 @@ def process(video, backends, prefer_sdh=False, ocr=None):
 
     with tempfile.TemporaryDirectory() as tmp:
         subs = None
-        src, lang = external_srt(video)
+        streams = probe_subs(video)
+        track, lang, reason = pick_track(streams, prefer_sdh)
+        # Externe Datei (Film.en.srt) nur, wenn der Film keine eigene Textspur hat: das Timing
+        # einer eingebetteten Spur passt sicher zum Film, das einer heruntergeladenen nicht immer.
+        src, ext_lang = (None, None) if track is not None or reason == GERMAN_REASON else external_srt(video)
         if src:
+            lang = ext_lang
             log.info("  nutze externe Datei %s (Sprache: %s)", src.name, lang)
         else:
-            streams = probe_subs(video)
-            track, lang, reason = pick_track(streams, prefer_sdh)
             if track is None:
                 german_text = any(lang_of_stream(s) == "de" and not is_forced(s)
                                   and s.get("codec_name") in TEXT_CODECS for s in streams)
@@ -1038,6 +1051,24 @@ def process(video, backends, prefer_sdh=False, ocr=None):
 
 
 LOCK_STALE_HOURS = 3
+
+# Größe/Änderungszeit jeder Datei beim ersten Sehen; erst wenn beides min_age lang gleich bleibt,
+# gilt die Datei als fertig. Nötig, weil Explorer beim Kopieren oft das ALTE Änderungsdatum setzt
+# und die Altersprüfung allein dann einen halb kopierten Film durchlassen würde.
+_SEEN = {}
+# Fehlversuche je Datei in diesem Lauf (nach MAX_FAILS als dauerhaft fehlerhaft merken)
+_FAILS = {}
+MAX_FAILS = 3
+
+
+def is_stable(video, st, min_age):
+    sig = (st.st_size, st.st_mtime)
+    old = _SEEN.get(video)
+    now = time.time()
+    if old is None or old[0] != sig:
+        _SEEN[video] = (sig, now)
+        return min_age <= 0
+    return now - old[1] >= min_age
 
 
 def take_lock(lock):
@@ -1183,7 +1214,8 @@ class Mover:
             return False
         log.info("Verschiebe %s%s", video.name, f" ({note})" if note else "")
         t0 = time.time()
-        total = sum(f.stat().st_size for f in files)
+        before = {f: (f.stat().st_size, f.stat().st_mtime) for f in files}
+        total = sum(sz for sz, _ in before.values())
         parts = []
         try:
             # 1) alles als .part ins Ziel kopieren und Größe prüfen
@@ -1194,6 +1226,10 @@ class Mover:
                 shutil.copy2(src, part)
                 if part.stat().st_size != src.stat().st_size:
                     raise OSError(f"Größe stimmt nach dem Kopieren nicht: {src.name}")
+            # Quelle während des Kopierens verändert (z. B. noch im Download)? Dann abbrechen.
+            for f, sig in before.items():
+                if (f.stat().st_size, f.stat().st_mtime) != sig:
+                    raise OSError(f"{f.name} hat sich während des Kopierens verändert")
             # 2) .part -> endgültiger Name (Video zuletzt, damit Jellyfin es erst komplett sieht)
             for (src, dst), part in zip(sorted(pairs, key=lambda x: x[0] == video), parts):
                 os.replace(part, dst)
@@ -1249,7 +1285,7 @@ def scan(root, backends, state, min_age, min_size, prefer_sdh=False, gate=None, 
                 log.warning("Übersprungen: %s ist keine Videodatei (erlaubt: mkv, mp4, m4v)", video.name)
             continue
         if video.with_name(video.stem + ".de.srt").exists():
-            if mover and time.time() - video.stat().st_mtime >= min_age:
+            if mover and is_stable(video, video.stat(), min_age):
                 lock = video.with_name(video.stem + ".de.srt.lock")
                 if take_lock(lock):
                     try:
@@ -1261,7 +1297,8 @@ def scan(root, backends, state, min_age, min_size, prefer_sdh=False, gate=None, 
                             video.stem + ".de.srt")
             continue
         st = video.stat()
-        if st.st_size < min_size or time.time() - st.st_mtime < min_age:
+        if st.st_size < min_size or (not explicit and not is_stable(video, st, min_age)) \
+                or (explicit and time.time() - st.st_mtime < min_age):
             if explicit:
                 log.warning("Übersprungen: Datei ist kleiner als --min-size-mb oder jünger als --min-age "
                             "(mit --min-age 0 --min-size-mb 0 erzwingen)")
@@ -1301,9 +1338,17 @@ def scan(root, backends, state, min_age, min_size, prefer_sdh=False, gate=None, 
         try:
             try:
                 result = process(video, backends, prefer_sdh, ocr)
-            except Exception:
-                log.exception("Fehler bei %s (neuer Versuch im nächsten Durchlauf)", video.name)
-                continue
+                _FAILS.pop(key, None)
+            except Exception as e:
+                n = _FAILS.get(key, 0) + 1
+                _FAILS[key] = n
+                if n < MAX_FAILS:
+                    log.exception("Fehler bei %s (Versuch %d von %d, neuer Versuch im nächsten Durchlauf)",
+                                  video.name, n, MAX_FAILS)
+                    continue
+                log.exception("Fehler bei %s, %d Versuche fehlgeschlagen, wird übersprungen", video.name, n)
+                result = (f"wiederholter Fehler ({e.__class__.__name__}: {str(e)[:150]})", None)
+                _FAILS.pop(key, None)
             if result:
                 reason, retry_hours = result
                 if reason.startswith("zurückgestellt"):
