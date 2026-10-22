@@ -178,18 +178,45 @@ def _plain_len(t):
 
 
 def _norm(t):
-    return re.sub(r"[\W_]+", "", re.sub(r"<[^>]+>", "", t)).lower()
+    """Zeilenanfang vergleichbar machen: Tags, Sprechernamen wie (Murphy) oder [MAN],
+    Zeilenumbrüche (auch als Text \\n), Satzzeichen und Groß/Klein entfernen."""
+    t = t.replace("\\n", " ").replace("\n", " ")
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"^[\s\-–\"'„“”«»♪]*((\([^)]*\)|\[[^\]]*\])\s*)+", "", t)   # (Sprecher) / [Geräusch] am Anfang
+    t = re.sub(r"^[\s\-–]*[A-ZÄÖÜ][A-ZÄÖÜ .']{1,20}:\s*", "", t)            # NAME: am Anfang
+    return re.sub(r"[\W_]+", "", t).lower()
+
+
+def _starts(e, line):
+    """Passt der abgeschriebene Anfang e (normalisiert) zu dieser Zeile?"""
+    full = re.sub(r"[\W_]+", "", re.sub(r"<[^>]+>", " ", line.replace("\\n", " "))).lower()
+    for cand in (_norm(line), full):
+        if not cand:
+            continue
+        k = min(len(e), len(cand), 12)
+        if k >= min(2, len(cand)) and cand.startswith(e[:k]):
+            return True
+    return False
 
 
 def anchor_ok(echo, src):
-    """Hat das Modell den Anfang der richtigen Originalzeile abgeschrieben?"""
-    e, s_ = _norm(echo), _norm(src)
-    if not s_:
-        return True
-    if not e:
-        return False
-    k = min(len(e), len(s_), 10)
-    return k >= min(3, len(s_)) and s_.startswith(e[:k])
+    """Einzelprüfung (für Tests/Kompatibilität): leer/unlesbar zählt nicht als Fehler."""
+    e = _norm(echo)
+    return True if not e else _starts(e, src)
+
+
+def anchors_shifted(echoes, lines):
+    """Index der ersten Zeile, deren abgeschriebener Anfang eindeutig zu einer ANDEREN Zeile
+    des Abschnitts passt (= Verschiebung), sonst None. Passt er zu keiner Zeile (übersetzt,
+    abgekürzt, kaputt), ist das kein Beweis für eine Verschiebung; dann entscheidet die Längenprüfung."""
+    for i, (echo, line) in enumerate(zip(echoes, lines)):
+        e = _norm(echo)
+        if len(e) < 3 or _starts(e, line):
+            continue
+        for j, other in enumerate(lines):
+            if j != i and _norm(other) and _starts(e, other):
+                return i, j
+    return None
 
 
 def shifted(src, out):
@@ -197,14 +224,18 @@ def shifted(src, out):
     Deutsch/Original von Zeile zu Zeile ähnlich. Rutscht Text in die Nachbarzeile, wird eine
     Zeile auffällig lang und die andere auffällig kurz. Vergleich mit dem Median des Abschnitts,
     damit es für jede Ausgangssprache funktioniert (auch Chinesisch -> Deutsch)."""
-    ratios = [(_plain_len(o) / _plain_len(s_)) for s_, o in zip(src, out) if _plain_len(s_) >= 12]
+    def countable(s_):
+        # reine Geräusch-/Musikbeschreibungen wie "(tense music)" oder "[DOOR SLAMS]" schwanken in der
+        # Länge stark und sagen nichts über Verschiebungen aus
+        return _plain_len(s_) >= 12 and not re.fullmatch(r"\s*(\([^)]*\)|\[[^\]]*\])\s*", re.sub(r"<[^>]+>", "", s_))
+    ratios = [(_plain_len(o) / _plain_len(s_)) for s_, o in zip(src, out) if countable(s_)]
     if len(ratios) < 3:
         return False
     med = sorted(ratios)[len(ratios) // 2]
     if med <= 0:
         return False
     for s_, o in zip(src, out):
-        if _plain_len(s_) >= 12:
+        if countable(s_):
             r = _plain_len(o) / _plain_len(s_)
             if r > med * 2.6 or r < med / 2.6:
                 return (s_, o)   # auffälliges Paar (für die Meldung)
@@ -386,11 +417,11 @@ class Ollama:
         # Leere Übersetzung für eine Zeile mit Text = Modell hat Text verschoben -> neu fragen
         if any(not x.strip() and has_letters(src_line) for x, src_line in zip(out, lines)):
             return None
-        bad = [] if len(lines) == 1 else [i for i, (e, s_) in enumerate(zip(echoes, lines)) if not anchor_ok(e, s_)]
+        bad = anchors_shifted(echoes, lines) if len(lines) > 1 else None
         if bad:
-            i = bad[0]
-            log.info("    Ollama: Zeile %d passt nicht zu ihrem Original, frage neu (erwartet %r, geliefert %r)",
-                     i + 1, lines[i][:30], echoes[i][:30])
+            i, j = bad
+            log.info("    Ollama: Zeile %d enthält den Anfang von Zeile %d (verschoben), frage neu (%r)",
+                     i + 1, j + 1, echoes[i][:30])
             return None
         odd = shifted(lines, out) if len(lines) > 1 else None
         if odd:
