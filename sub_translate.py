@@ -173,6 +173,20 @@ def clean_single(text, src_line):
     return "\n".join(lines)
 
 
+COMPACT_SCRIPTS = {"zh", "ja", "ko", "th"}   # Schriften, die viel kompakter als Deutsch sind
+
+
+def incomplete(src_line, de_line, lang):
+    """Deutsche Übersetzung auffällig kurz -> vermutlich abgeschnitten.
+    Deutsch ist fast immer mindestens so lang wie Englisch/Französisch/Spanisch usw."""
+    if lang in COMPACT_SCRIPTS:
+        return False
+    s_, d = _plain_len(src_line), _plain_len(de_line)
+    if s_ < 18 or re.fullmatch(r"\s*(\([^)]*\)|\[[^\]]*\])\s*", re.sub(r"<[^>]+>", "", src_line)):
+        return False
+    return d < 0.6 * s_
+
+
 def _plain_len(t):
     return len(re.sub(r"<[^>]+>|[\s%s]" % NOTES, "", t))
 
@@ -322,10 +336,13 @@ class Ollama:
         system = (
             f"You translate film subtitles from {lang} into natural, idiomatic German as used in "
             "professional German subtitles. You get ONE subtitle line plus neighbouring lines for context. "
-            "Translate ONLY that one line, exactly what is said in it; never add content from the context "
-            "lines (an incomplete German fragment is fine if the sentence continues). Keep HTML tags like "
-            "<i>...</i>, music symbols like ♪ and line breaks. Reply with the German translation only: "
-            "no quotes, no notes, no explanations."
+            "Translate that one line COMPLETELY and by its meaning (not word for word): every piece of "
+            "information in the line must appear in the German, nothing may be left out or cut off. Use the "
+            "context lines only to understand who speaks and what is meant; do not translate them. If the "
+            "line continues a sentence from the previous line or into the next one, translate this line's "
+            "part so it reads naturally in German. Use natural spoken German (du/Sie fitting the situation). "
+            "Keep HTML tags like <i>...</i>, music symbols like ♪ and line breaks. Reply with the German "
+            "translation only: no quotes, no notes, no explanations."
         )
         parts = []
         if context:
@@ -339,7 +356,17 @@ class Ollama:
             "options": {"temperature": 0.2, "num_ctx": self.num_ctx,
                         "num_predict": min(400, 40 + 2 * len(line))},
         }
-        return clean_single(self._post(body), line)
+        out = clean_single(self._post(body), line)
+        if out and incomplete(line, out, src):
+            log.info("    Ollama: Übersetzung unvollständig, frage neu (%r -> %r)", line[:40], out[:40])
+            body["messages"].append({"role": "assistant", "content": out})
+            body["messages"].append({"role": "user", "content":
+                "Your translation is incomplete: parts of the line are missing. Translate the WHOLE line again, "
+                "completely. Reply with the German translation only."})
+            again = clean_single(self._post(body), line)
+            if again and _plain_len(again) > _plain_len(out):
+                out = again
+        return out
 
     def _ask(self, lines, src, context, after=()):
         if len(lines) == 1:
@@ -354,10 +381,12 @@ class Ollama:
             "Each key holds an object with two fields: 'src' = the first three words of THAT key's line "
             "copied character by character in the ORIGINAL language (do NOT translate 'src'; for languages "
             "without spaces: its first 5 characters), and 'de' = the German translation of THAT key's line.\n"
-            "- Each key is shown on screen at its own fixed time. Translate EVERY key on its own, "
-            "exactly what is said in that key. NEVER move words, names or meaning into a neighbouring key, "
-            "even if a sentence continues in the next key. An incomplete German fragment is fine and "
-            "expected in that case. Never leave a key empty.\n"
+            "- Each key is shown on screen at its own fixed time. Translate EVERY key COMPLETELY and by its "
+            "meaning (not word for word): every piece of information in that key's line must appear in its "
+            "German text, nothing may be left out or cut off. NEVER move words, names or meaning into a "
+            "neighbouring key. If a sentence continues over several keys, translate each key's part so it "
+            "reads naturally. Never leave a key empty.\n"
+            "- Use natural spoken German (du/Sie fitting the situation).\n"
             "- Keep HTML tags like <i>...</i> and music symbols like ♪ where they are.\n"
             "- Keep line breaks inside an item if sensible; keep it short and readable.\n"
             "- 'context_before' and 'context_after' show the neighbouring lines ONLY for understanding. "
@@ -422,6 +451,11 @@ class Ollama:
             i, j = bad
             log.info("    Ollama: Zeile %d enthält den Anfang von Zeile %d (verschoben), frage neu (%r)",
                      i + 1, j + 1, echoes[i][:30])
+            return None
+        short = next((i for i, (s_, o) in enumerate(zip(lines, out)) if incomplete(s_, o, src)), None)
+        if short is not None:
+            log.info("    Ollama: Zeile %d unvollständig übersetzt, frage neu (%r -> %r)",
+                     short + 1, lines[short][:40], out[short][:40])
             return None
         odd = shifted(lines, out) if len(lines) > 1 else None
         if odd:
