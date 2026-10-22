@@ -123,7 +123,7 @@ Startet versehentlich eine zweite Instanz, beendet sie sich selbst mit „Dauerb
 
 Schreibt `Film.vergleich.txt` ins aktuelle Verzeichnis: Original und Deutsch Einblendung für Einblendung, mit Zeitstempeln und Hinweis auf abweichende Zeiten. Damit lässt sich prüfen, ob die richtige Spur übersetzt wurde und ob jede deutsche Zeile zu ihrer Originalzeile passt. Bei `--compare` dieselben Spur-Optionen (`--prefer-sdh`) wie im Dauerbetrieb angeben.
 
-Ollama muss in jedem Feld zuerst den Anfang der Originalzeile abschreiben. So kann das Skript erkennen, wenn Text in eine Nachbarzeile gerutscht ist, und fragt den Abschnitt in diesem Fall neu an.
+Ollama übersetzt standardmäßig **jede Einblendung in einer eigenen Anfrage** (die Nachbarzeilen gehen nur als Kontext mit). Dadurch kann kein Text in eine andere Einblendung rutschen und sich ein Versatz nicht über den Film fortpflanzen. Mit `--ollama-batch 25` werden mehrere Zeilen pro Anfrage übersetzt: schneller, aber mit Restrisiko. Dann muss Ollama in jedem Feld den Anfang der Originalzeile abschreiben, und bei Abweichung wird der Abschnitt neu angefragt.
 
 ## Wichtige Optionen
 
@@ -132,6 +132,7 @@ Ollama muss in jedem Feld zuerst den Anfang der Originalzeile abschreiben. So ka
 | `--watch` | dauerhaft laufen, alle `--interval` Sekunden prüfen (Standard 300) |
 | `--use ollama,azure,deepl,argos` | Übersetzer und Reihenfolge |
 | `--ollama-model gemma3:12b` | Ollama-Modell |
+| `--ollama-batch 1` | Zeilen pro Ollama-Anfrage (1 = sicher, größer = schneller) |
 | `--ollama-parallel 3` | gleichzeitige Anfragen (passend zu `OLLAMA_NUM_PARALLEL`) |
 | `--ollama-keep-alive 1m` | wie lange das Modell nach der letzten Anfrage geladen bleibt |
 | `--ollama-grace-min 60` | so lange auf Ollama warten, bevor ausgewichen wird |

@@ -193,16 +193,19 @@ class Ollama:
     """Lokales Sprachmodell über Ollama. Übersetzt mit Kontext der vorherigen Zeilen,
     mehrere Abschnitte gleichzeitig (Ollama braucht dafür OLLAMA_NUM_PARALLEL >= parallel)."""
     name = "Ollama"
-    batch = 25
-    context_lines = 4
+    batch = 1          # Zeilen pro Anfrage; 1 = jede Einblendung einzeln (kein Verrutschen möglich)
+    context_lines = 4  # vorherige Zeilen als Kontext
+    after_lines = 2    # folgende Zeilen als Kontext
     whole_file = True  # bekommt die ganze Datei auf einmal, damit parallel gearbeitet werden kann
 
-    def __init__(self, model, url="http://localhost:11434", parallel=3, grace_min=60, keep_alive="1m"):
+    def __init__(self, model, url="http://localhost:11434", parallel=3, grace_min=60, keep_alive="1m",
+                 batch=1):
         self.model = model
         self.keep_alive = keep_alive
         self.base = url.rstrip("/")
         self.url = self.base + "/api/chat"
         self.parallel = max(1, parallel)
+        self.batch = max(1, batch)
         self.grace = grace_min * 60
         self.down_since = None
         self.name = f"Ollama ({model})"
@@ -243,7 +246,7 @@ class Ollama:
         self.retries = 0
         self.started = time.time()
 
-    def _ask(self, lines, src, context):
+    def _ask(self, lines, src, context, after=()):
         lang = LANG_NAMES.get(src, "the source language (detect it)")
         system = (
             f"You are a professional subtitle translator. Translate film subtitles from {lang} "
@@ -259,11 +262,13 @@ class Ollama:
             "expected in that case. Never leave a key empty.\n"
             "- Keep HTML tags like <i>...</i> and music symbols like ♪ where they are.\n"
             "- Keep line breaks inside an item if sensible; keep it short and readable.\n"
-            "- 'context' only shows the previous lines for understanding; do not translate it.\n"
+            "- 'context_before' and 'context_after' show the neighbouring lines ONLY for understanding. "
+            "Never translate them and never put any of their content into a key.\n"
             "- Output only the JSON object, no explanations."
         )
         keys = [f"l{i + 1}" for i in range(len(lines))]
-        user = json.dumps({"context": context, "lines": dict(zip(keys, lines))}, ensure_ascii=False)
+        user = json.dumps({"context_before": list(context), "lines": dict(zip(keys, lines)),
+                           "context_after": list(after)}, ensure_ascii=False)
         # Feste Schlüssel: Ollama erzwingt beim Erzeugen genau diese Felder in dieser Reihenfolge,
         # das Modell kann also keine Zeilen zusammenlegen oder weglassen.
         schema = {
@@ -323,14 +328,14 @@ class Ollama:
             return None
         return out
 
-    def _translate_chunk(self, lines, src, context):
-        out = self._ask(lines, src, context)
+    def _translate_chunk(self, lines, src, context, after=()):
+        out = self._ask(lines, src, context, after)
         if out is None:  # ungültige Antwort: Abschnitt halbieren und neu fragen
             with self._lock:
                 self.retries += 1
             log.info("    Ollama: ungültige Antwort für %d Zeilen, frage in kleineren Teilen neu", len(lines))
             if len(lines) == 1:
-                out = self._ask(lines, src, context)
+                out = self._ask(lines, src, context, after)
                 if out is None:
                     # Eine einzelne Zeile lässt nicht den ganzen Film zum nächsten Übersetzer wandern
                     log.warning("    Ollama: Zeile bleibt unübersetzt: %r", lines[0][:80])
@@ -338,19 +343,22 @@ class Ollama:
                 return out
             mid = len(lines) // 2
             second_ctx = (context + lines[:mid])[-self.context_lines:]
-            return (self._translate_chunk(lines[:mid], src, context)
-                    + self._translate_chunk(lines[mid:], src, second_ctx))
+            return (self._translate_chunk(lines[:mid], src, context, lines[mid:mid + self.after_lines])
+                    + self._translate_chunk(lines[mid:], src, second_ctx, after))
         return out
 
-    def _job(self, chunk, src, context):
-        t0 = time.time()
-        res = self._translate_chunk(chunk, src, context)
+    def _job(self, chunk, src, context, after):
+        res = self._translate_chunk(chunk, src, context, after)
         with self._lock:
+            before = self.done
             self.done += len(chunk)
-            elapsed = time.time() - self.started
-            eta = elapsed / self.done * (self.total - self.done) if self.total and self.done else 0
-            log.info("    Ollama: %d/%d Zeilen (Abschnitt %.0f s, bisher %.1f min, noch ca. %.0f min)",
-                     self.done, self.total, time.time() - t0, elapsed / 60, eta / 60)
+            # Fortschritt höchstens in 10-%-Schritten loggen (bei 1 Zeile pro Anfrage sonst zu viel)
+            step = max(1, self.total // 10) if self.total else 1
+            if self.done // step != before // step or self.done >= self.total:
+                elapsed = time.time() - self.started
+                eta = elapsed / self.done * (self.total - self.done) if self.total and self.done else 0
+                log.info("    Ollama: %d/%d Zeilen (bisher %.1f min, noch ca. %.0f min)",
+                         self.done, self.total, elapsed / 60, eta / 60)
         return res
 
     def translate(self, texts, src):
@@ -361,10 +369,11 @@ class Ollama:
             # Kontext = vorherige Originalzeilen; die sind vorab bekannt, daher sind
             # die Abschnitte voneinander unabhängig und können parallel laufen
             context = texts[max(0, i - self.context_lines):i]
-            jobs.append((texts[i:i + self.batch], context))
+            after = texts[i + self.batch:i + self.batch + self.after_lines]
+            jobs.append((texts[i:i + self.batch], context, after))
         pool = ThreadPoolExecutor(max_workers=self.parallel)
         try:
-            futures = [pool.submit(self._job, chunk, src, ctx) for chunk, ctx in jobs]
+            futures = [pool.submit(self._job, chunk, src, ctx, aft) for chunk, ctx, aft in jobs]
             out = []
             for f in futures:
                 out += f.result()  # Reihenfolge bleibt erhalten
@@ -1425,7 +1434,7 @@ def build_backends(spec, args):
     for name in [s.strip().lower() for s in spec.split(",") if s.strip()]:
         if name == "ollama":
             o = Ollama(args.ollama_model, args.ollama_url, args.ollama_parallel, args.ollama_grace_min,
-                       args.ollama_keep_alive)
+                       args.ollama_keep_alive, args.ollama_batch)
             try:
                 r = requests.get(args.ollama_url.rstrip("/") + "/api/tags", timeout=5)
                 models = [m.get("name", "") for m in r.json().get("models", [])]
@@ -1440,7 +1449,8 @@ def build_backends(spec, args):
             elif want not in models:
                 log.warning("Ollama-Modell %s fehlt, einmal ausführen: ollama pull %s",
                             args.ollama_model, args.ollama_model)
-            log.info("Übersetzer: %s, %d Anfragen gleichzeitig", o.name, o.parallel)
+            log.info("Übersetzer: %s, %d Anfragen gleichzeitig, %s", o.name, o.parallel,
+                     "jede Einblendung einzeln" if o.batch == 1 else f"{o.batch} Zeilen pro Anfrage")
             backends.append(o)
         elif name == "azure":
             vals, source = read_secret("AZURE_TRANSLATOR_KEY", "azure_key.txt")
@@ -1477,6 +1487,9 @@ def main():
                     help="Übersetzer und Reihenfolge, kommagetrennt (Standard: ollama,azure,deepl,argos)")
     ap.add_argument("--ollama-model", default="gemma3:12b", help="Ollama-Modell (Standard: gemma3:12b)")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--ollama-batch", type=int, default=1,
+                    help="Zeilen pro Ollama-Anfrage (Standard 1 = jede Einblendung einzeln, kein Verrutschen "
+                         "möglich; größere Werte sind schneller, aber mit Restrisiko)")
     ap.add_argument("--ollama-parallel", type=int, default=3,
                     help="gleichzeitige Anfragen an Ollama (Standard 3; OLLAMA_NUM_PARALLEL passend setzen)")
     ap.add_argument("--ollama-keep-alive", default="1m",
