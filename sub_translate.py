@@ -982,7 +982,13 @@ def process(video, backends, prefer_sdh=False, ocr=None):
 
     with tempfile.TemporaryDirectory() as tmp:
         subs = None
-        streams = probe_subs(video)
+        try:
+            streams = probe_subs(video)
+        except subprocess.CalledProcessError as e:
+            if not external_srt(video)[0]:
+                raise
+            log.warning("  ffprobe kann die Datei nicht lesen (%s), nutze die Untertiteldatei daneben", e.returncode)
+            streams = []
         track, lang, reason = pick_track(streams, prefer_sdh)
         # Externe Datei (Film.en.srt) nur, wenn der Film keine eigene Textspur hat: das Timing
         # einer eingebetteten Spur passt sicher zum Film, das einer heruntergeladenen nicht immer.
