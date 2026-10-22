@@ -11,7 +11,9 @@ Ablauf pro Video (mkv/mp4/m4v):
   5. Übersetzen, in dieser Reihenfolge (änderbar mit --use):
        Ollama (lokales Sprachmodell) -> Azure Translator -> DeepL -> Argos (offline).
      Ist ein Übersetzer nicht eingerichtet, nicht erreichbar oder sein Kontingent leer,
-     übernimmt der nächste die ganze Datei.
+     übernimmt der nächste die ganze Datei. Ist Ollama nur kurz weg, wird der Film später
+     erneut versucht (--ollama-grace-min). Einzelne Zeilen, an denen Ollama scheitert,
+     übernimmt der nächste Übersetzer.
      Keys: azure_key.txt (Zeile 1 Key, Zeile 2 Region) und deepl_key.txt neben dem Skript,
      oder AZURE_TRANSLATOR_KEY / AZURE_TRANSLATOR_REGION / DEEPL_API_KEY.
   6. Film.de.srt neben das Video schreiben (Jellyfin findet sie automatisch)
@@ -24,6 +26,7 @@ Benötigt: ffmpeg/ffprobe, pip install srt requests argostranslate
 Aufruf:   python sub_translate.py --watch   (Standardordner: Desktop/Filme des Benutzers)
 """
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -34,7 +37,8 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -106,7 +110,15 @@ class NoBackend(Exception):
 
 
 class OllamaDown(Unsupported):
-    """Ollama antwortet nicht (Verbindungsfehler)."""
+    """Ollama antwortet nicht oder nur mit Fehlern, auch nach mehreren Versuchen."""
+
+
+class _RequestFailed(Exception):
+    """Eine einzelne Ollama-Anfrage ist auch nach mehreren Versuchen fehlgeschlagen."""
+
+
+class _Aborted(Exception):
+    """Übersetzung der Datei abgebrochen, weil ein anderer Abschnitt schwer gescheitert ist."""
 
 
 class Postpone(Exception):
@@ -221,119 +233,181 @@ def _plain_len(t):
     return len(re.sub(r"<[^>]+>|[\s%s]" % NOTES, "", t))
 
 
-def _norm(t):
-    """Zeilenanfang vergleichbar machen: Tags, Sprechernamen wie (Murphy) oder [MAN],
-    Zeilenumbrüche (auch als Text \\n), Satzzeichen und Groß/Klein entfernen."""
-    t = t.replace("\\n", " ").replace("\n", " ")
+ECHO_OK = 0.85  # so ähnlich muss die vom Modell abgeschriebene Zeile dem Original mindestens sein
+
+
+def _letters(t):
+    """Nur Buchstaben und Ziffern, klein: macht Zeilen vergleichbar (Tags, Satzzeichen und
+    Zeilenumbrüche, auch als Text \\n, zählen nicht)."""
+    t = (t or "").replace("\\n", " ")
     t = re.sub(r"<[^>]+>", " ", t)
-    t = re.sub(r"^[\s\-–\"'„“”«»♪]*((\([^)]*\)|\[[^\]]*\])\s*)+", "", t)   # (Sprecher) / [Geräusch] am Anfang
-    t = re.sub(r"^[\s\-–]*[A-ZÄÖÜ][A-ZÄÖÜ .']{1,20}:\s*", "", t)            # NAME: am Anfang
     return re.sub(r"[\W_]+", "", t).lower()
 
 
-def _starts(e, line):
-    """Passt der abgeschriebene Anfang e (normalisiert) zu dieser Zeile?"""
-    full = re.sub(r"[\W_]+", "", re.sub(r"<[^>]+>", " ", line.replace("\\n", " "))).lower()
-    for cand in (_norm(line), full):
-        if not cand:
-            continue
-        k = min(len(e), len(cand), 12)
-        if k >= min(2, len(cand)) and cand.startswith(e[:k]):
-            return True
-    return False
+def echo_score(echo, line):
+    """Wie genau passt die vom Modell abgeschriebene Zeile zur echten Originalzeile? (0 bis 1)"""
+    a, b = _letters(echo), _letters(line)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
-def anchor_ok(echo, src):
-    """Einzelprüfung (für Tests/Kompatibilität): leer/unlesbar zählt nicht als Fehler."""
-    e = _norm(echo)
-    return True if not e else _starts(e, src)
-
-
-def anchors_shifted(echoes, lines):
-    """Index der ersten Zeile, deren abgeschriebener Anfang eindeutig zu einer ANDEREN Zeile
-    des Abschnitts passt (= Verschiebung), sonst None. Passt er zu keiner Zeile (übersetzt,
-    abgekürzt, kaputt), ist das kein Beweis für eine Verschiebung; dann entscheidet die Längenprüfung."""
+def find_shift(echoes, lines, context=(), after=()):
+    """Erste Zeile, deren abgeschriebenes Original eindeutig zu einer ANDEREN Zeile gehört
+    (im Abschnitt oder im Kontext). Ergebnis (i, j) oder None; j < 0 heißt Kontext davor,
+    j >= len(lines) Kontext danach. Gleich lautende Zeilen (Refrain, "Yeah.") zählen nicht."""
+    others = list(context) + list(lines) + list(after)
+    off = len(context)
     for i, (echo, line) in enumerate(zip(echoes, lines)):
-        e = _norm(echo)
-        if len(e) < 3 or _starts(e, line):
+        own = echo_score(echo, line)
+        if own >= 0.98:  # (praktisch) wörtlich abgeschrieben
             continue
-        for j, other in enumerate(lines):
-            if j != i and _norm(other) and _starts(e, other):
-                return i, j
+        mine = _letters(line)
+        best, where = 0.0, None
+        for j, other in enumerate(others):
+            if j - off == i or _letters(other) == mine:
+                continue
+            sc = echo_score(echo, other)
+            if sc > best:
+                best, where = sc, j - off
+        # passt eindeutig besser zu einer anderen Zeile (ähnliche Zeilen wie "and forgive us our
+        # debts" / "as we forgive our debtors" werden so trotzdem auseinandergehalten)
+        if best >= ECHO_OK and best > own + 0.05:
+            return i, where
     return None
 
 
-def shifted(src, out):
-    """Erkennt verschobenen Text: Bei korrekter Übersetzung ist das Längenverhältnis
-    Deutsch/Original von Zeile zu Zeile ähnlich. Rutscht Text in die Nachbarzeile, wird eine
-    Zeile auffällig lang und die andere auffällig kurz. Vergleich mit dem Median des Abschnitts,
-    damit es für jede Ausgangssprache funktioniert (auch Chinesisch -> Deutsch)."""
-    def countable(s_):
-        # reine Geräusch-/Musikbeschreibungen wie "(tense music)" oder "[DOOR SLAMS]" schwanken in der
-        # Länge stark und sagen nichts über Verschiebungen aus
-        return _plain_len(s_) >= 12 and not re.fullmatch(r"\s*(\([^)]*\)|\[[^\]]*\])\s*", re.sub(r"<[^>]+>", "", s_))
-    ratios = [(_plain_len(o) / _plain_len(s_)) for s_, o in zip(src, out) if countable(s_)]
-    if len(ratios) < 3:
+def untranslated(line, de):
+    """Wurde ein richtiger Satz einfach unverändert übernommen? Kurze Ausrufe und Namen
+    ("Okay!", "Murphy!") dürfen gleich bleiben."""
+    if len(re.findall(r"[^\W\d_]{2,}", re.sub(r"<[^>]+>", " ", line))) < 3:
         return False
-    med = sorted(ratios)[len(ratios) // 2]
+    return echo_score(de, line) > 0.9
+
+
+def short_groups(src, out, lang, prev_line=None):
+    """Alle Sätze (als Bereich (a, b) von Einblendungen), deren deutsche Fassung deutlich kürzer
+    ist als das Original. Ein Satz darf sich im Deutschen anders auf seine Einblendungen
+    verteilen, in der Summe darf aber nichts fehlen. Sätze, die am Abschnittsrand angeschnitten
+    sind, werden nicht bewertet (ihr Rest liegt im Nachbarabschnitt)."""
+    if lang in COMPACT_SCRIPTS:
+        return []
+    groups, start = [], 0
+    first_ok = prev_line is None or _ends_sentence(prev_line)
+    for i, line in enumerate(src):
+        if _ends_sentence(line):
+            if start > 0 or first_ok:
+                groups.append((start, i))
+            start = i + 1
+    found = []
+    for a, b in groups:
+        s_ = sum(_text_len(x) for x in src[a:b + 1])
+        d = sum(_text_len(x or "") for x in out[a:b + 1])
+        if s_ >= 18 and d < 0.6 * s_:
+            found.append((a, b))
+    return found
+
+
+def length_outliers(src, out):
+    """Einblendungen, deren Übersetzung im Verhältnis zum Original auffällig lang oder kurz ist,
+    verglichen mit dem übrigen Abschnitt: Hinweis auf Text aus einer Nachbarzeile. Reine
+    Geräuschbeschreibungen wie "(laughs)" schwanken zu stark und zählen nicht."""
+    def countable(k):
+        s_ = src[k]
+        return (out[k] and _plain_len(s_) >= 12
+                and not re.fullmatch(r"\s*(\([^)]*\)|\[[^\]]*\])\s*", re.sub(r"<[^>]+>", "", s_)))
+    ratios = {k: _plain_len(out[k]) / _plain_len(src[k]) for k in range(len(src)) if countable(k)}
+    if len(ratios) < 4:
+        return []
+    med = sorted(ratios.values())[len(ratios) // 2]
     if med <= 0:
-        return False
-    for s_, o in zip(src, out):
-        if countable(s_):
-            r = _plain_len(o) / _plain_len(s_)
-            if r > med * 2.6 or r < med / 2.6:
-                return (s_, o)   # auffälliges Paar (für die Meldung)
-    return None
+        return []
+    return [k for k, r in ratios.items() if r > med * 2.6 or r < med / 2.6]
+
+
+class _Run:
+    """Zustand der Übersetzung einer Datei: Fortschritt, Statistik, gemeinsamer Abbruch."""
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.started = time.time()
+        self.lock = threading.Lock()
+        self.abort = threading.Event()
+        self.error = None        # erster schwerer Fehler (bricht die ganze Datei ab)
+        self.fails_in_row = 0    # endgültig gescheiterte Anfragen ohne Erfolg dazwischen
+        self.stats = Counter()
+
+    def count(self, key, n=1):
+        with self.lock:
+            self.stats[key] += n
 
 
 class Ollama:
-    """Lokales Sprachmodell über Ollama. Übersetzt mit Kontext der vorherigen Zeilen,
-    mehrere Abschnitte gleichzeitig (Ollama braucht dafür OLLAMA_NUM_PARALLEL >= parallel)."""
+    """Lokales Sprachmodell über Ollama. Mehrere Abschnitte laufen gleichzeitig
+    (Ollama braucht dafür OLLAMA_NUM_PARALLEL >= parallel).
+
+    Mehrzeilenmodus: Das Modell schreibt zu jeder Einblendung zuerst das Original vollständig ab
+    und übersetzt dann genau diesen Text. So bleibt jede Übersetzung an ihrer Einblendung, und eine
+    Verschiebung ist am abgeschriebenen Original sicher zu erkennen. Auffällige Zeilen (verschoben,
+    leer, unvollständig, nicht übersetzt) werden gezielt einzeln neu übersetzt, statt den ganzen
+    Abschnitt immer wieder neu anzufragen."""
     name = "Ollama"
-    batch = 1          # Zeilen pro Anfrage; 1 = jede Einblendung einzeln (kein Verrutschen möglich)
     context_lines = 4  # vorherige Zeilen als Kontext
     after_lines = 2    # folgende Zeilen als Kontext
     whole_file = True  # bekommt die ganze Datei auf einmal, damit parallel gearbeitet werden kann
+    retry_waits = (2, 8, 20)   # Sekunden Pause vor erneutem Versuch (Verbindungsfehler, HTTP 5xx)
+    timeout = 600
+    incident_gap = 30 * 60     # Fehler mit so viel Abstand gehören nicht mehr zum selben Ausfall
 
     def __init__(self, model, url="http://localhost:11434", parallel=3, grace_min=60, keep_alive="1m",
-                 batch=1):
+                 batch=10):
         self.model = model
         self.keep_alive = keep_alive
         self.base = url.rstrip("/")
         self.url = self.base + "/api/chat"
         self.parallel = max(1, parallel)
         self.batch = max(1, batch)
-        # Im Einzelmodus sind die Anfragen klein: weniger Kontext pro Anfrage spart Grafikspeicher und
-        # erlaubt mehr parallele Anfragen. Für alle Anfragen gleich halten, sonst lädt Ollama das Modell neu.
+        # Für alle Anfragen gleich halten (auch für einzeln nachübersetzte Zeilen), sonst lädt
+        # Ollama das Modell neu. Im Einzelmodus reicht weniger und spart Grafikspeicher.
         self.num_ctx = 2048 if self.batch == 1 else 4096
         self.grace = grace_min * 60
         self.down_since = None
+        self.last_fail = 0.0
         self.name = f"Ollama ({model})"
         self._lock = threading.Lock()
-        self.retries = self.short = self.done = self.total = 0
-        self.started = time.time()
-        self.start_file()
 
     # --- Erreichbarkeit -------------------------------------------------
     def mark_down(self):
         with self._lock:
-            if self.down_since is None:
-                self.down_since = time.time()
+            now = time.time()
+            if self.down_since is None or now - self.last_fail > self.incident_gap:
+                self.down_since = now
+            self.last_fail = now
+
+    def _ok(self, run):
+        with self._lock:
+            self.down_since = None
+        with run.lock:
+            run.fails_in_row = 0
 
     def available(self):
+        """Antwortet der Ollama-Server überhaupt? Ein Erfolg hier beendet einen Ausfall nicht:
+        Das tut erst eine gelungene Übersetzung (der Server kann laufen, aber nur Fehler liefern)."""
         try:
             ok = requests.get(self.base + "/api/tags", timeout=3).status_code == 200
         except requests.RequestException:
             ok = False
-        if ok:
-            self.down_since = None
-        else:
+        if not ok:
             self.mark_down()
         return ok
 
     def within_grace(self):
-        """True, solange Ollama noch nicht länger als die Wartezeit weg ist."""
-        return self.down_since is not None and time.time() - self.down_since < self.grace
+        """True, solange der aktuelle Ausfall noch nicht länger als die Wartezeit dauert."""
+        with self._lock:
+            return self.down_since is not None and time.time() - self.down_since < self.grace
 
     def unload(self):
         """Modell sofort aus dem Grafikspeicher entfernen."""
@@ -342,29 +416,129 @@ class Ollama:
         except requests.RequestException:
             pass
 
-    def start_file(self, total=0):
-        self.total = total
-        self.done = 0
-        self.retries = 0
-        self.short = 0
-        self.started = time.time()
+    # --- Anfragen -------------------------------------------------------
+    def _post(self, body, run):
+        """Eine Anfrage an Ollama, gibt den Antworttext zurück. Vorübergehende Fehler (keine
+        Verbindung, HTTP 5xx, unlesbare Antwort) werden nach kurzer Pause wiederholt."""
+        err = "unbekannter Fehler"
+        for attempt in range(len(self.retry_waits) + 1):
+            if run.abort.is_set():
+                raise _Aborted()
+            run.count("requests")
+            retry = True
+            try:
+                r = requests.post(self.url, json=body, timeout=self.timeout)
+            except requests.RequestException as e:
+                err = f"nicht erreichbar ({e.__class__.__name__}), läuft Ollama?"
+            else:
+                if r.status_code == 404:
+                    raise Unsupported(f"Modell fehlt, einmal ausführen: ollama pull {self.model}")
+                if r.status_code >= 400:
+                    err = f"HTTP {r.status_code}: {r.text[:200].strip()}"
+                    retry = r.status_code >= 500 or r.status_code in (408, 429)
+                else:
+                    try:
+                        content = (r.json().get("message") or {}).get("content") or ""
+                    except (ValueError, AttributeError):
+                        err = "unlesbare Antwort"
+                    else:
+                        self._ok(run)
+                        return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+            if not retry or attempt == len(self.retry_waits):
+                break
+            run.count("http_retry")
+            log.info("    Ollama: %s, neuer Versuch in %d s", err, self.retry_waits[attempt])
+            if run.abort.wait(self.retry_waits[attempt]):
+                raise _Aborted()
+        with run.lock:
+            run.fails_in_row += 1
+            in_row = run.fails_in_row
+        if in_row >= 3:
+            # Mehrere Anfragen hintereinander gescheitert: Liegt es an Ollama oder an diesen Zeilen?
+            if not self._probe(run):
+                self.mark_down()
+                raise OllamaDown(f"Ollama {err}")
+            with run.lock:
+                run.fails_in_row = 0
+        log.warning("    Ollama: Anfrage fehlgeschlagen (%s)", err)
+        raise _RequestFailed(err)
 
-    def _post(self, body):
+    def _probe(self, run):
+        """Winzige Testanfrage: Arbeitet Ollama grundsätzlich? (gleiches num_ctx, sonst lädt es neu)"""
+        if run.abort.is_set():
+            raise _Aborted()
         try:
-            r = requests.post(self.url, json=body, timeout=600)
-        except requests.RequestException as e:
-            self.mark_down()
-            raise OllamaDown(f"Ollama nicht erreichbar ({e.__class__.__name__}). Läuft Ollama?")
-        if r.status_code == 404:
-            raise Unsupported(f"Modell fehlt, einmal ausführen: ollama pull {self.model}")
-        if r.status_code >= 400:
-            raise Unsupported(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
-        content = r.json().get("message", {}).get("content", "")
-        return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+            r = requests.post(self.url, json={
+                "model": self.model, "stream": False, "keep_alive": self.keep_alive,
+                "messages": [{"role": "user", "content": "Reply with OK."}],
+                "options": {"num_ctx": self.num_ctx, "num_predict": 2}}, timeout=120)
+            return r.status_code == 200
+        except requests.RequestException:
+            return False
 
-    def _ask_single(self, line, src, context, after):
-        """Eine Einblendung, Antwort als reiner Text (ohne JSON): deutlich weniger zu schreiben,
-        daher schneller. Verrutschen ist unmöglich, weil es nur diese eine Zeile gibt."""
+    def _ask_batch(self, lines, src, context, after, run, temperature=0.2):
+        """Mehrere Einblendungen in einer Anfrage. Ergebnis (abgeschriebene Originale,
+        Übersetzungen) oder None, wenn die Antwort unbrauchbar ist."""
+        lang = LANG_NAMES.get(src, "the source language")
+        system = (
+            f"You are a professional subtitle translator. Translate film subtitles from {lang} into natural, "
+            "idiomatic German as used in professional German subtitles (du/Sie as fits the situation).\n"
+            "'lines' maps keys (l1, l2, ...) to subtitle lines in film order; each key is shown on screen at "
+            "its own time. Return a JSON object with exactly the same keys. Each key holds a pair "
+            "[original, german]:\n"
+            "1. original: THAT key's complete original line, copied exactly word for word (do not translate, "
+            "shorten or correct it).\n"
+            "2. german: the German translation of that complete original line: every part of it, nothing left "
+            "out, nothing taken from other keys.\n"
+            "Rules:\n"
+            "- Translate every line on its own. If a sentence continues in the next line, the German for this "
+            "line ends where its original ends and the sentence continues in the next line. Never move words "
+            "or meaning into another line.\n"
+            "- Keep HTML tags like <i>...</i>, symbols around song lyrics like ♪ or *, speaker names like FRED: "
+            "and line breaks. Translate sound descriptions like (laughs) or [door slams].\n"
+            "- 'context_before' and 'context_after' are neighbouring lines for understanding only: never copy "
+            "or translate them.\n"
+            "- Output only the JSON object, written compactly without indentation."
+        )
+        keys = [f"l{i + 1}" for i in range(len(lines))]
+        user = json.dumps({"context_before": list(context), "lines": dict(zip(keys, lines)),
+                           "context_after": list(after)}, ensure_ascii=False)
+        # Feste Schlüssel in fester Reihenfolge, je ein Paar [Original, Deutsch]: Ollama erzwingt beim
+        # Erzeugen genau diese Felder, Zeilen können weder fehlen noch verschmelzen. Dass das Modell
+        # zuerst das Original abschreibt, hält die Übersetzung an der richtigen Zeile fest.
+        pair = {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}
+        schema = {"type": "object", "properties": {k: pair for k in keys}, "required": keys,
+                  "additionalProperties": False}
+        total = sum(len(l) for l in lines)
+        body = {
+            "model": self.model, "stream": False,
+            # Modell nach kurzer Leerlaufzeit aus dem Speicher entladen (Standard 1 min, --ollama-keep-alive)
+            "keep_alive": self.keep_alive,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "format": schema,
+            # num_predict begrenzt die Antwortlänge: verhindert, dass das Modell bei JSON-Ausgabe
+            # endlos Leerzeichen erzeugt (bekanntes Problem, kostet sonst Minuten pro Abschnitt)
+            "options": {"temperature": temperature, "num_ctx": self.num_ctx,
+                        "num_predict": min(2048, 150 + int(total * 1.2) + 15 * len(lines))},
+        }
+        content = self._post(body, run)
+        try:
+            obj = json.loads(content)
+            items = [obj[k] for k in keys]
+            if not all(isinstance(it, list) and len(it) == 2 for it in items):
+                raise TypeError("kein Paar")
+            echoes = [it[0] for it in items]
+            outs = [it[1] for it in items]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            log.debug("    Ollama: Antwort nicht lesbar: %r", content[:300])
+            return None
+        if not all(isinstance(x, str) for x in echoes + outs):
+            return None
+        return echoes, outs
+
+    def _ask_single(self, line, src, context, after, run, strict=False):
+        """Eine Einblendung, Antwort als reiner Text (ohne JSON). Verrutschen ist unmöglich,
+        weil es nur diese eine Zeile gibt. None, wenn die Antwort unbrauchbar ist."""
         lang = LANG_NAMES.get(src, "the source language")
         system = (
             f"You translate film subtitles from {lang} into natural, idiomatic German as used in "
@@ -376,6 +550,9 @@ class Ollama:
             "Keep HTML tags like <i>...</i>, music symbols like ♪ and line breaks. Reply with the German "
             "translation only: no quotes, no notes, no explanations."
         )
+        if strict:
+            system += (" Translate ONLY the text after 'LINE TO TRANSLATE', nothing before or after it, "
+                       "and reply with exactly one German subtitle.")
         parts = []
         if context:
             parts.append("Previous lines (context, do not translate):\n" + "\n".join(f"- {c}" for c in context))
@@ -385,175 +562,225 @@ class Ollama:
         body = {
             "model": self.model, "stream": False, "keep_alive": self.keep_alive,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}],
-            "options": {"temperature": 0.2, "num_ctx": self.num_ctx,
+            "options": {"temperature": 0.4 if strict else 0.2, "num_ctx": self.num_ctx,
                         "num_predict": min(400, 40 + 2 * len(line))},
         }
-        out = clean_single(self._post(body), line)
+        out = clean_single(self._post(body, run), line)
         if out and incomplete(line, out, src, context[-1] if context else None):
-            log.info("    Ollama: Übersetzung unvollständig, frage neu (%r -> %r)", line[:40], out[:40])
+            log.debug("    Ollama: Übersetzung unvollständig, frage neu (%r -> %r)", line[:40], out[:40])
             body["messages"].append({"role": "assistant", "content": out})
             body["messages"].append({"role": "user", "content":
                 "Your translation is incomplete: parts of the line are missing. Translate the WHOLE line again, "
                 "completely. Reply with the German translation only."})
-            again = clean_single(self._post(body), line)
+            again = clean_single(self._post(body, run), line)
             if again and _plain_len(again) > _plain_len(out):
                 out = again
         return out
 
-    def _ask(self, lines, src, context, after=()):
+    def _single(self, line, src, context, after, run):
+        """Eine Einblendung einzeln übersetzen; None, wenn auch das nicht klappt.
+        Wie im Mehrzeilenmodus schreibt das Modell zuerst das Original ab. Ohne das übersetzt es
+        gern die folgende Kontextzeile gleich mit (bei gemma3:12b auf dem PC beobachtet)."""
+        run.count("single")
+        attempts = []  # mit Kontext, ohne folgende Zeilen, ganz ohne Kontext (doppelte weglassen)
+        for ctx, aft, temp in ((list(context), list(after), 0.2), (list(context), [], 0.5), ([], [], 0.5)):
+            if all((ctx, aft) != (c, a) for c, a, _ in attempts):
+                attempts.append((ctx, aft, temp))
+        k = 0
+        while k < len(attempts):
+            ctx, aft, temp = attempts[k]
+            k += 1
+            try:
+                ans = self._ask_batch([line], src, ctx, aft, run, temp)
+            except _RequestFailed:
+                if not (ctx or aft):
+                    return None  # scheitert sogar ganz ohne Kontext: liegt an der Zeile selbst
+                k = len(attempts) - 1  # vielleicht stört eine Nachbarzeile: gleich ohne Kontext
+                continue
+            if ans:
+                echo, de = ans[0][0], ans[1][0].strip()
+                if echo_score(echo, line) >= ECHO_OK and has_letters(de) and not untranslated(line, de):
+                    return de
+        try:  # letzter Versuch: reiner Text, ohne Kontext
+            return self._ask_single(line, src, (), (), run, strict=True)
+        except _RequestFailed:
+            return None
+
+    def _singles(self, lines, src, context, after, run):
+        out = []
+        for k, line in enumerate(lines):
+            ctx = (list(context) + lines[:k])[-self.context_lines:]
+            aft = (lines[k + 1:] + list(after))[:self.after_lines]
+            out.append(self._single(line, src, ctx, aft, run))
+        return out
+
+    # --- Abschnitte -----------------------------------------------------
+    def _chunk(self, lines, src, context, after, run, depth=0):
+        """Übersetzt einen Abschnitt. Liefert je Zeile die Übersetzung oder None (nicht übersetzbar)."""
         if len(lines) == 1:
-            out = self._ask_single(lines[0], src, context, after)
-            return [out] if out else None
-        lang = LANG_NAMES.get(src, "the source language (detect it)")
-        system = (
-            f"You are a professional subtitle translator. Translate film subtitles from {lang} "
-            "into natural, idiomatic German as used in professional German subtitles.\n"
-            "Rules:\n"
-            "- 'lines' maps keys (l1, l2, ...) to subtitle lines. Return an object with exactly the same keys. "
-            "Each key holds an object with two fields: first 'de' = the German translation of THAT key's "
-            "WHOLE line, from its first to its last word; then 'src' = the first three words of THAT key's "
-            "line copied character by character in the ORIGINAL language (only a check mark, it does not "
-            "limit 'de'; do NOT translate 'src'; for languages without spaces: its first 5 characters).\n"
-            "- Each key is shown on screen at its own fixed time. Translate by meaning, in natural spoken "
-            "German (du/Sie fitting the situation). If a sentence runs over several keys, distribute the German "
-            "sentence naturally over exactly those keys (German word order may shift words between them), "
-            "but NEVER move anything into a key that belongs to a different sentence. The complete meaning "
-            "of every sentence must be there: nothing may be left out. Never leave a key empty.\n"
-            "- Keep HTML tags like <i>...</i> and music symbols like ♪ where they are.\n"
-            "- Keep line breaks inside an item if sensible; keep it short and readable.\n"
-            "- 'context_before' and 'context_after' show the neighbouring lines ONLY for understanding. "
-            "Never translate them and never put any of their content into a key.\n"
-            "- Output only the JSON object, no explanations."
-        )
-        keys = [f"l{i + 1}" for i in range(len(lines))]
-        user = json.dumps({"context_before": list(context), "lines": dict(zip(keys, lines)),
-                           "context_after": list(after)}, ensure_ascii=False)
-        # Feste Schlüssel: Ollama erzwingt beim Erzeugen genau diese Felder in dieser Reihenfolge,
-        # das Modell kann also keine Zeilen zusammenlegen oder weglassen.
-        schema = {
-            "type": "object",
-            "properties": {k: {"type": "object",
-                               "properties": {"de": {"type": "string"}, "src": {"type": "string"}},
-                               "required": ["de", "src"], "additionalProperties": False} for k in keys},
-            "required": keys,
-            "additionalProperties": False,
-        }
-        body = {
-            "model": self.model,
-            "stream": False,
-            # Modell nach kurzer Leerlaufzeit aus dem Speicher entladen (Standard 1 min, --ollama-keep-alive)
-            "keep_alive": self.keep_alive,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "format": schema,
-            # num_predict begrenzt die Antwortlänge: verhindert, dass das Modell bei JSON-Ausgabe
-            # endlos Leerzeichen erzeugt (bekanntes Problem, kostet sonst Minuten pro Abschnitt)
-            # 4096 Token reichen für 25 Zeilen samt Antwort locker und sparen Grafikspeicher,
-            # der bei parallelen Anfragen pro Anfrage reserviert wird
-            "options": {"temperature": 0.2, "num_ctx": self.num_ctx,
-                        "num_predict": min(4000, 200 + 2 * sum(len(l) for l in lines) + 20 * len(lines))},
-        }
-        try:
-            r = requests.post(self.url, json=body, timeout=600)
-        except requests.RequestException as e:
-            self.mark_down()
-            raise OllamaDown(f"Ollama nicht erreichbar ({e.__class__.__name__}). Läuft Ollama?")
-        if r.status_code == 404:
-            raise Unsupported(f"Modell fehlt, einmal ausführen: ollama pull {self.model}")
-        if r.status_code >= 400:
-            raise Unsupported(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
-        data = r.json()
-        if data.get("eval_count"):
-            log.debug("    Ollama: %s Tokens in %.1f s", data["eval_count"], data.get("eval_duration", 0) / 1e9)
-        content = data.get("message", {}).get("content", "")
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
-        try:
-            obj = json.loads(content)
-            out = [obj[k]["de"] for k in keys]
-            echoes = [obj[k]["src"] for k in keys]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            log.debug("    Ollama: Antwort nicht lesbar: %r", content[:300])
-            return None
-        if not all(isinstance(x, str) for x in out):
-            return None
-        # Leere Übersetzung für eine Zeile mit Text = Modell hat Text verschoben -> neu fragen
-        if any(not x.strip() and has_letters(src_line) for x, src_line in zip(out, lines)):
-            return None
-        bad = anchors_shifted(echoes, lines) if len(lines) > 1 else None
-        if bad:
-            i, j = bad
-            log.info("    Ollama: Zeile %d enthält den Anfang von Zeile %d (verschoben), frage neu (%r)",
-                     i + 1, j + 1, echoes[i][:30])
-            return None
-        odd = shifted(lines, out) if len(lines) > 1 else None
-        if odd:
-            log.info("    Ollama: Länge auffällig, Text evtl. verschoben, frage neu (%r -> %r)",
-                     odd[0][:40], odd[1][:40])
-            return None
-        # Nur zur Kontrolle im Log, ohne Neuanfrage (eine Neuanfrage liefert meist dieselbe Antwort)
-        prob = sentence_problem(lines, out, src, context[-1] if context else None) if len(lines) > 1 else None
-        if prob:
-            with self._lock:
-                self.short += 1
-            log.debug("    Ollama: Satz evtl. unvollständig (%r -> %r)", prob[0][:50], prob[1][:50])
-        return out
-
-    def _translate_chunk(self, lines, src, context, after=()):
-        out = self._ask(lines, src, context, after)
-        if out is None:  # ungültige Antwort: Abschnitt halbieren und neu fragen
-            with self._lock:
-                self.retries += 1
-            log.info("    Ollama: ungültige Antwort für %d Zeilen, frage in kleineren Teilen neu", len(lines))
-            if len(lines) == 1:
-                out = self._ask(lines, src, context, after)
-                if out is None:
-                    # Eine einzelne Zeile lässt nicht den ganzen Film zum nächsten Übersetzer wandern
-                    log.warning("    Ollama: Zeile bleibt unübersetzt: %r", lines[0][:80])
-                    return lines
-                return out
+            return [self._single(lines[0], src, context, after, run)]
+        for attempt in range(2):
+            try:
+                ans = self._ask_batch(lines, src, context, after, run, 0.2 if attempt == 0 else 0.5)
+            except _RequestFailed:
+                break  # wurde schon mehrmals versucht: gleich in kleineren Teilen weiter
+            if ans is None:
+                run.count("invalid")
+                continue
+            echoes, outs = ans
+            shift = find_shift(echoes, lines, context, after)
+            if shift:
+                # Ab Zeile i gehört das Abgeschriebene zu einer anderen Zeile: davor ist alles in
+                # Ordnung, ab dort wird neu übersetzt (kleinerer Abschnitt bzw. einzeln)
+                i, j = shift
+                run.count("shift")
+                log.debug("    Ollama: Zeile %d enthält das Original von %s (verschoben), ab dort neu: %r",
+                          i + 1, f"Zeile {j + 1}" if 0 <= j < len(lines) else "einer Kontextzeile",
+                          echoes[i][:50])
+                head = self._finish(lines[:i], echoes[:i], outs[:i], src, context,
+                                    lines[i:i + self.after_lines], run)
+                ctx2 = (list(context) + lines[:i])[-self.context_lines:]
+                tail = lines[i:]
+                if len(tail) >= 3 and depth < 2:
+                    return head + self._chunk(tail, src, ctx2, after, run, depth + 1)
+                return head + self._singles(tail, src, ctx2, after, run)
+            wrong = sum(echo_score(e, l) < ECHO_OK for e, l in zip(echoes, lines))
+            if wrong * 2 > len(lines):  # Original überwiegend nicht abgeschrieben: Antwort unbrauchbar
+                log.debug("    Ollama: Originale in der Antwort passen nicht (%d von %d)", wrong, len(lines))
+                run.count("invalid")
+                continue
+            return self._finish(lines, echoes, outs, src, context, after, run)
+        # zweimal unbrauchbar oder Anfrage gescheitert: in zwei Hälften, zuletzt einzeln
+        if len(lines) >= 4 and depth < 2:
             mid = len(lines) // 2
-            second_ctx = (context + lines[:mid])[-self.context_lines:]
-            return (self._translate_chunk(lines[:mid], src, context, lines[mid:mid + self.after_lines])
-                    + self._translate_chunk(lines[mid:], src, second_ctx, after))
-        return out
+            ctx2 = (list(context) + lines[:mid])[-self.context_lines:]
+            return (self._chunk(lines[:mid], src, context, lines[mid:mid + self.after_lines], run, depth + 1)
+                    + self._chunk(lines[mid:], src, ctx2, after, run, depth + 1))
+        return self._singles(lines, src, context, after, run)
 
-    def _job(self, chunk, src, context, after):
-        res = self._translate_chunk(chunk, src, context, after)
-        with self._lock:
-            before = self.done
-            self.done += len(chunk)
-            # Fortschritt höchstens in 10-%-Schritten loggen (bei 1 Zeile pro Anfrage sonst zu viel)
-            step = max(1, self.total // 10) if self.total else 1
-            if self.done // step != before // step or self.done >= self.total:
-                elapsed = time.time() - self.started
-                eta = elapsed / self.done * (self.total - self.done) if self.total and self.done else 0
-                log.info("    Ollama: %d/%d Zeilen (bisher %.1f min, noch ca. %.0f min)",
-                         self.done, self.total, elapsed / 60, eta / 60)
+    def _finish(self, lines, echoes, outs, src, context, after, run):
+        """Prüft jede Zeile einer Mehrzeilen-Antwort; auffällige Zeilen werden einzeln neu übersetzt."""
+        res = [o.strip() for o in outs]
+
+        def alone(k):
+            ctx = (list(context) + lines[:k])[-self.context_lines:]
+            aft = (lines[k + 1:] + list(after))[:self.after_lines]
+            return self._single(lines[k], src, ctx, aft, run)
+
+        bad = {}
+        for k, (line, echo, de) in enumerate(zip(lines, echoes, res)):
+            if echo_score(echo, line) < ECHO_OK:
+                bad[k] = "Original nicht korrekt abgeschrieben"
+            elif not has_letters(de):
+                bad[k] = "leer"
+            elif untranslated(line, de):
+                bad[k] = "nicht übersetzt"
+        for k, why in bad.items():
+            log.debug("    Ollama: Zeile einzeln neu (%s): %r -> %r", why, lines[k][:50], res[k][:50])
+            alt = alone(k)
+            if alt is not None:
+                res[k] = alt
+            elif why != "Original nicht korrekt abgeschrieben" or not has_letters(res[k]):
+                res[k] = None  # bleibt offen, übernimmt der nächste Übersetzer
+        redone = set(bad)
+        for k in length_outliers(lines, res):
+            if k in redone:
+                continue
+            log.debug("    Ollama: Länge auffällig, Zeile einzeln neu: %r -> %r", lines[k][:50], res[k][:50])
+            alt = alone(k)
+            if alt is not None:
+                res[k] = alt
+            redone.add(k)
+        for a, b in short_groups(lines, res, src, context[-1] if context else None):
+            ks = [k for k in range(a, b + 1) if k not in redone]
+            if not ks:
+                continue
+            log.debug("    Ollama: Satz evtl. unvollständig, einzeln neu: %r -> %r",
+                      " / ".join(lines[a:b + 1])[:60], " / ".join(r or "" for r in res[a:b + 1])[:60])
+            alts = [alone(k) for k in ks]
+            # nur übernehmen, wenn es wirklich vollständiger ist (gute Übersetzungen sind oft knapp)
+            if all(x is not None for x in alts) and \
+                    sum(_text_len(x) for x in alts) > 1.15 * sum(_text_len(res[k] or "") for k in ks):
+                for k, x in zip(ks, alts):
+                    res[k] = x
+                run.count("longer", len(ks))
         return res
 
-    def translate(self, texts, src):
-        # Schutz-Tags für DeepL braucht das Modell nicht
-        texts = [re.sub(r"</?span[^>]*>", "", t) for t in texts]
-        jobs = []
-        for i in range(0, len(texts), self.batch):
-            # Kontext = vorherige Originalzeilen; die sind vorab bekannt, daher sind
-            # die Abschnitte voneinander unabhängig und können parallel laufen
-            context = texts[max(0, i - self.context_lines):i]
-            after = texts[i + self.batch:i + self.batch + self.after_lines]
-            jobs.append((texts[i:i + self.batch], context, after))
-        pool = ThreadPoolExecutor(max_workers=self.parallel)
+    def _job(self, chunk, src, context, after, run):
         try:
-            futures = [pool.submit(self._job, chunk, src, ctx, aft) for chunk, ctx, aft in jobs]
-            out = []
+            res = self._chunk(chunk, src, context, after, run)
+        except (OllamaDown, Unsupported) as e:
+            with run.lock:
+                if run.error is None:
+                    run.error = e
+            run.abort.set()  # die anderen Abschnitte nicht weiterlaufen lassen
+            raise
+        with run.lock:
+            before = run.done
+            run.done += len(chunk)
+            # Fortschritt höchstens in 10-%-Schritten loggen
+            step = max(1, run.total // 10)
+            if run.done // step != before // step or run.done >= run.total:
+                elapsed = time.time() - run.started
+                eta = elapsed / run.done * (run.total - run.done)
+                log.info("    Ollama: %d/%d Zeilen (bisher %.1f min, noch ca. %.0f min)",
+                         run.done, run.total, elapsed / 60, eta / 60)
+        return res
+
+    def _plan(self, texts):
+        """Abschnitte (Anfang, Ende, Kontext davor, Kontext danach). Im Mehrzeilenmodus möglichst
+        an einem Satzende schneiden, damit kein Satz auf zwei Anfragen verteilt wird."""
+        jobs, i, n = [], 0, len(texts)
+        while i < n:
+            end = min(n, i + self.batch)
+            if end < n and self.batch >= 4:
+                for d in (0, -1, 1, -2, 2, -3):
+                    e = end + d
+                    if i + 2 <= e <= n and _ends_sentence(texts[e - 1]):
+                        end = e
+                        break
+            jobs.append((i, end, texts[max(0, i - self.context_lines):i], texts[end:end + self.after_lines]))
+            i = end
+        return jobs
+
+    @staticmethod
+    def _stop(futures):
+        """Nach einem Abbruch: wartende Abschnitte verwerfen, laufende kurz zu Ende kommen lassen,
+        damit keine Anfragen mehr in den nächsten Film hineinlaufen."""
+        for f in futures:
+            f.cancel()
+        wait(futures, timeout=15)
+
+    def translate(self, texts, src):
+        """Ganze Datei. Liefert je Zeile die Übersetzung oder None (konnte Ollama nicht übersetzen)."""
+        texts = [re.sub(r"</?span[^>]*>", "", t) for t in texts]  # Schutz-Tags für DeepL braucht das Modell nicht
+        run = _Run(len(texts))
+        pool = ThreadPoolExecutor(max_workers=self.parallel)
+        futures = [pool.submit(self._job, texts[a:b], src, ctx, aft, run) for a, b, ctx, aft in self._plan(texts)]
+        out = []
+        try:
             for f in futures:
                 out += f.result()  # Reihenfolge bleibt erhalten
-            if self.batch > 1:
-                log.info("    Ollama: Neuanfragen %d, Sätze evtl. unvollständig %d", self.retries, self.short)
-            return out
+        except _Aborted:
+            self._stop(futures)
+            raise run.error or OllamaDown("Übersetzung abgebrochen")
         except BaseException:
-            pool.shutdown(wait=False, cancel_futures=True)
+            run.abort.set()
+            self._stop(futures)
             raise
         finally:
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=False, cancel_futures=True)
+        s = run.stats
+        failed = sum(t is None for t in out)
+        notes = [f"{n} {one if n == 1 else many}" for n, one, many in (
+            (s["single"] if self.batch > 1 else 0, "Zeile einzeln nachübersetzt", "Zeilen einzeln nachübersetzt"),
+            (s["shift"], "Verschiebung erkannt und korrigiert", "Verschiebungen erkannt und korrigiert"),
+            (s["invalid"], "unbrauchbare Antwort neu angefragt", "unbrauchbare Antworten neu angefragt"),
+            (s["http_retry"], "Wiederholung nach Serverfehler", "Wiederholungen nach Serverfehlern"),
+            (failed, "Zeile nicht übersetzt", "Zeilen nicht übersetzt")) if n]
+        log.info("    Ollama: %d Zeilen in %d Anfragen, %.1f min%s", len(texts), s["requests"],
+                 (time.time() - run.started) / 60, " (" + ", ".join(notes) + ")" if notes else "")
+        return out
 
 
 # Azure verwendet für Chinesisch eigene Codes; dort lieber automatisch erkennen lassen
@@ -602,22 +829,28 @@ class Argos:
 
     def _load(self):
         if self._tr is None:
-            import argostranslate.package as pkg
-            import argostranslate.translate as tr
+            try:
+                import argostranslate.package as pkg
+                import argostranslate.translate as tr
+            except ImportError:
+                raise Unsupported("Argos ist nicht installiert (pip install argostranslate)")
             self._pkg, self._tr = pkg, tr
 
     def _ensure(self, a, b):
         """Sprachpaket a->b installieren, falls nötig. True wenn verfügbar."""
         if any(p.from_code == a and p.to_code == b for p in self._pkg.get_installed_packages()):
             return True
-        if not self._index_loaded:
-            self._pkg.update_package_index()
-            self._index_loaded = True
-        for p in self._pkg.get_available_packages():
-            if p.from_code == a and p.to_code == b:
-                log.info("  Argos: lade Sprachpaket %s->%s herunter ...", a, b)
-                self._pkg.install_from_path(p.download())
-                return True
+        try:
+            if not self._index_loaded:
+                self._pkg.update_package_index()
+                self._index_loaded = True
+            for p in self._pkg.get_available_packages():
+                if p.from_code == a and p.to_code == b:
+                    log.info("  Argos: lade Sprachpaket %s->%s herunter ...", a, b)
+                    self._pkg.install_from_path(p.download())
+                    return True
+        except Exception as e:  # z. B. kein Internet
+            raise Unsupported(f"Argos kann das Sprachpaket {a}->{b} nicht laden ({e.__class__.__name__})")
         return False
 
     def _route(self, src):
@@ -653,32 +886,66 @@ class Argos:
         return out
 
 
-def translate_all(texts, backends, src):
-    """Ganze Datei mit einem Backend; geht das nicht, komplett mit dem nächsten."""
-    reasons = []
-    for b in backends:
+def _run_backend(b, texts, src):
+    if getattr(b, "whole_file", False):
+        return b.translate(texts, src)
+    out = []
+    for i in range(0, len(texts), BATCH):
+        out += b.translate(texts[i:i + BATCH], src)
+    return out
+
+
+def fill_missing(out, texts, missing, rest, src, who):
+    """Zeilen, die ein Übersetzer nicht geschafft hat, dem nächsten verfügbaren geben. Klappt das
+    nirgends, bleibt dort der Originaltext stehen (besser als eine leere Einblendung)."""
+    todo = [texts[i] for i in missing]
+    what = "Zeile" if len(todo) == 1 else "Zeilen"
+    sample = "; ".join(repr(re.sub(r"<[^>]+>", "", t)[:50]) for t in todo[:3]) + (" …" if len(todo) > 3 else "")
+    for b in rest:
+        if isinstance(b, Ollama):
+            continue
         try:
-            if hasattr(b, "start_file"):
-                b.start_file(len(texts))
-            out = []
-            if getattr(b, "whole_file", False):
-                out = b.translate(texts, src)
-            else:
-                for i in range(0, len(texts), BATCH):
-                    out += b.translate(texts[i:i + BATCH], src)
-            chars = sum(len(re.sub(r"<[^>]+>", "", t)) for t in texts)
-            log.info("  übersetzt mit %s (%d Zeichen)", b.name, chars)
-            return out
+            got = _run_backend(b, todo, src)
+            if len(got) != len(todo) or any(t is None for t in got):
+                raise Unsupported("unvollständige Antwort")
+        except Exception as e:  # nur ein Rettungsversuch: darf den Film nicht scheitern lassen
+            log.warning("  %s kann die %d offenen %s nicht übernehmen (%s)", b.name, len(todo), what, e)
+            continue
+        for i, t in zip(missing, got):
+            out[i] = t
+        log.info("  %d %s, die %s nicht übersetzen konnte, übernimmt %s: %s", len(todo), what, who, b.name, sample)
+        return
+    for i in missing:
+        out[i] = texts[i]
+    log.warning("  %d %s %s unübersetzt (Original): %s", len(todo), what,
+                "bleibt" if len(todo) == 1 else "bleiben", sample)
+
+
+def translate_all(texts, backends, src):
+    """Ganze Datei mit einem Backend; geht das nicht, komplett mit dem nächsten. Einzelne Zeilen,
+    die das Backend nicht übersetzen konnte, übernimmt der nächste verfügbare Übersetzer."""
+    reasons = []
+    for k, b in enumerate(backends):
+        try:
+            out = _run_backend(b, texts, src)
         except OllamaDown as e:
             if b.within_grace():
                 # kurzer Ausfall: lieber später nochmal, statt Azure/DeepL-Kontingent zu verbrauchen
                 raise Postpone(str(e))
-            log.warning("  %s seit über %d min nicht erreichbar, weiche auf nächsten Übersetzer aus",
-                        b.name, b.grace // 60)
+            log.warning("  %s seit über %d min nicht nutzbar (%s), weiche auf nächsten Übersetzer aus",
+                        b.name, b.grace // 60, e)
             reasons.append(f"{b.name}: {e}")
-        except (QuotaExceeded, Unsupported) as e:
+            continue
+        except (QuotaExceeded, Unsupported, requests.RequestException, RuntimeError) as e:
             log.warning("  %s nicht nutzbar (%s)", b.name, e)
             reasons.append(f"{b.name}: {e}")
+            continue
+        missing = [i for i, t in enumerate(out) if t is None]
+        if missing:
+            fill_missing(out, texts, missing, backends[k + 1:], src, b.name)
+        chars = sum(len(re.sub(r"<[^>]+>", "", t)) for t in texts)
+        log.info("  übersetzt mit %s (%d Zeichen)", b.name, chars)
+        return out
     raise NoBackend("; ".join(reasons) or "kein Übersetzer aktiv")
 
 
@@ -1082,6 +1349,29 @@ def fix_notes(src, dst):
     return dst
 
 
+_EDGE = r"[-–♪♫♬♩*#\s]*"
+_ITALIC = re.compile(rf"^({_EDGE})<i>((?:(?!</?i>).)*)</i>({_EDGE})$", re.S)
+_CORE = re.compile(rf"^({_EDGE})(.*?)({_EDGE})$", re.S)
+
+
+def fix_italics(src, dst):
+    """Kursivschrift wieder ergänzen, wenn das Original ganz kursiv ist (Lieder, Stimmen aus dem
+    Off) und die Übersetzung die Tags verloren hat. Zeichen wie ♪, * oder - bleiben außen."""
+    if "<i>" not in src or re.search(r"</?i>", dst):
+        return dst
+
+    def wrap(t):
+        m = _CORE.match(t)
+        return f"{m.group(1)}<i>{m.group(2)}</i>{m.group(3)}" if m and m.group(2) else t
+    if _ITALIC.match(src):  # alles kursiv, auch über Zeilenumbrüche hinweg
+        return wrap(dst)
+    src_lines = [l for l in src.split("\n") if l.strip()]
+    dst_lines = dst.split("\n")
+    if len(src_lines) == len([l for l in dst_lines if l.strip()]) and all(_ITALIC.match(l) for l in src_lines):
+        return "\n".join(wrap(l) if l.strip() else l for l in dst_lines)
+    return dst
+
+
 # --------------------------------------------------------------------------
 # Verarbeitung
 # --------------------------------------------------------------------------
@@ -1229,7 +1519,7 @@ def process(video, backends, prefer_sdh=False, ocr=None):
         except Postpone as e:
             return f"zurückgestellt: {e}", POSTPONE_MIN / 60
         for i, t in zip(idx, translated):
-            subs[i].content = fix_notes(cleaned[i], t)
+            subs[i].content = fix_italics(cleaned[i], fix_notes(cleaned[i], t))
 
         write_srt(target, subs)
         log.info("  fertig: %s", target.name)
@@ -1658,9 +1948,10 @@ def main():
                     help="Übersetzer und Reihenfolge, kommagetrennt (Standard: ollama,azure,deepl,argos)")
     ap.add_argument("--ollama-model", default="gemma3:12b", help="Ollama-Modell (Standard: gemma3:12b)")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
-    ap.add_argument("--ollama-batch", type=int, default=1,
-                    help="Zeilen pro Ollama-Anfrage (Standard 1 = jede Einblendung einzeln, kein Verrutschen "
-                         "möglich; größere Werte sind schneller, aber mit Restrisiko)")
+    ap.add_argument("--ollama-batch", type=int, default=10,
+                    help="Zeilen pro Ollama-Anfrage (Standard 10; das Modell schreibt jede Zeile ab, bevor es "
+                         "sie übersetzt, Verschiebungen werden erkannt und einzeln korrigiert. "
+                         "1 = jede Einblendung einzeln, deutlich langsamer)")
     ap.add_argument("--ollama-parallel", type=int, default=3,
                     help="gleichzeitige Anfragen an Ollama (Standard 3; OLLAMA_NUM_PARALLEL passend setzen)")
     ap.add_argument("--ollama-keep-alive", default="1m",
@@ -1689,6 +1980,8 @@ def main():
                     help="auch Filme verschieben, die nicht übersetzt werden können (nur Bild-Untertitel, keine Spur)")
     ap.add_argument("--log-file", type=Path, default=None,
                     help="Log zusätzlich in diese Datei schreiben (praktisch für den Windows-Aufgabenplaner)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="ausführliches Log: jede einzeln nachübersetzte oder korrigierte Zeile anzeigen")
     ap.add_argument("--state", type=Path,
                     default=Path.home() / ".cache" / "sub_translate_state_v2.json",
                     help="Merkliste übersprungener Filme")
@@ -1706,6 +1999,8 @@ def main():
         handlers.append(logging.NullHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if args.verbose:
+        log.setLevel(logging.DEBUG)  # nur die eigenen Meldungen, nicht die von requests/urllib3
     if args.watch and not args.folder.exists():
         # Dauerbetrieb: auf den Ordner warten (z. B. externes Laufwerk noch nicht angeschlossen)
         log.warning("Ordner %s nicht vorhanden, warte darauf (Prüfung alle %d s) ...", args.folder, args.interval)

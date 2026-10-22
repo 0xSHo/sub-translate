@@ -24,14 +24,14 @@ Die Zeitstempel kommen immer aus der Spur, die zum Film gehört. So gibt es kein
 | DeepL API | begrenztes Freikontingent | sehr gut | nur Rückfallebene |
 | Argos Translate | kostenlos, offline | mäßig | letzte Rückfallebene |
 
-Ist Ollama nur kurz weg (z. B. nach dem Hochfahren), wartet das Skript bis zu 60 Minuten, statt die Kontingente von Azure oder DeepL zu verbrauchen.
+Ist Ollama nur kurz weg (z. B. nach dem Hochfahren), wartet das Skript bis zu 60 Minuten, statt die Kontingente von Azure oder DeepL zu verbrauchen. Kurze Aussetzer und Serverfehler (HTTP 500) werden automatisch wiederholt. Einzelne Zeilen, an denen Ollama endgültig scheitert, übernimmt der nächste Übersetzer, statt auf Englisch stehen zu bleiben.
 
 ## Weitere Funktionen
 
 - **Dauerbetrieb** mit `--watch`: Der Ordner wird alle 5 Minuten geprüft. Laufende Downloads (jünger als 3 Minuten) und Samples (unter 100 MB) werden übersprungen.
 - **Spielpause:** Während ein Spiel oder Vollbildprogramm läuft oder die GPU ausgelastet ist, wartet das Skript und gibt den Grafikspeicher frei.
 - **Verschieben** mit `--move-to`: Fertige Filme samt Untertiteln wandern auf den Medienserver. Das ist sicher bei Netzabbrüchen, denn es wird erst kopiert, dann geprüft und erst danach gelöscht.
-- **Notensymbole ♪** bleiben erhalten, Kursivschrift bei Ollama, Azure und DeepL ebenfalls.
+- **Notensymbole ♪ und Kursivschrift** bleiben erhalten. Gehen sie bei der Übersetzung verloren, ergänzt das Skript sie wieder.
 - **Robust:** Sperrdateien gegen doppelte Bearbeitung, Merkliste für nicht übersetzbare Filme, Log mit Größenbegrenzung.
 
 ## Installation (Windows)
@@ -123,7 +123,13 @@ Startet versehentlich eine zweite Instanz, beendet sie sich selbst mit „Dauerb
 
 Schreibt `Film.vergleich.txt` in den Ordner des Skripts: Original und Deutsch Einblendung für Einblendung, mit Zeitstempeln und Hinweis auf abweichende Zeiten. Damit lässt sich prüfen, ob die richtige Spur übersetzt wurde und ob jede deutsche Zeile zu ihrer Originalzeile passt. Bei `--compare` dieselben Spur-Optionen (`--prefer-sdh`) wie im Dauerbetrieb angeben.
 
-Ollama übersetzt standardmäßig **jede Einblendung in einer eigenen Anfrage** (die Nachbarzeilen gehen nur als Kontext mit). Dadurch kann kein Text in eine andere Einblendung rutschen und sich ein Versatz nicht über den Film fortpflanzen. Ollama antwortet dabei mit reinem Text statt JSON. Das hält die Anfragen kurz. Mit wenig Kontext pro Anfrage (2048 Token) passen auch 8 parallele Anfragen in 16 GB Grafikspeicher (`OLLAMA_NUM_PARALLEL 8` und `--ollama-parallel 8`). Mit `--ollama-batch 25` werden mehrere Zeilen pro Anfrage übersetzt: schneller, aber mit Restrisiko. Dann muss Ollama in jedem Feld den Anfang der Originalzeile abschreiben, und bei Abweichung wird der Abschnitt neu angefragt.
+### So übersetzt Ollama
+
+Ollama bekommt **10 Einblendungen pro Anfrage** (`--ollama-batch`), möglichst bis zu einem Satzende, dazu ein paar Nachbarzeilen als Kontext. Zu jeder Einblendung schreibt das Modell **zuerst das Original vollständig ab und übersetzt dann genau diesen Text**. Das hält jede Übersetzung an ihrer Einblendung fest, und eine Verschiebung ist am abgeschriebenen Original sicher zu erkennen. Auffällige Zeilen (verschoben, leer, nicht übersetzt, deutlich zu kurz) werden gezielt einzeln nachübersetzt, statt den ganzen Abschnitt zu wiederholen. Am Ende jedes Films steht im Log eine Zusammenfassung, z. B. `Ollama: 1369 Zeilen in 140 Anfragen, 3.4 min (2 Zeilen einzeln nachübersetzt)`. Mit `--verbose` steht jede nachübersetzte Zeile im Log.
+
+Mit `--ollama-batch 1` geht jede Einblendung einzeln an Ollama. Das ist deutlich langsamer und bringt beim Versatz keinen Vorteil mehr.
+
+Eine Grenze bleibt: Schreibt das Modell eine Zeile richtig ab und übersetzt sie trotzdem falsch, fällt das keiner Prüfung auf. Im Zweifel hilft `--compare`.
 
 ## Wichtige Optionen
 
@@ -132,7 +138,7 @@ Ollama übersetzt standardmäßig **jede Einblendung in einer eigenen Anfrage** 
 | `--watch` | dauerhaft laufen, alle `--interval` Sekunden prüfen (Standard 300) |
 | `--use ollama,azure,deepl,argos` | Übersetzer und Reihenfolge |
 | `--ollama-model gemma3:12b` | Ollama-Modell |
-| `--ollama-batch 1` | Zeilen pro Ollama-Anfrage (1 = sicher, größer = schneller) |
+| `--ollama-batch 10` | Zeilen pro Ollama-Anfrage (1 = jede Einblendung einzeln, deutlich langsamer) |
 | `--ollama-parallel 3` | gleichzeitige Anfragen (passend zu `OLLAMA_NUM_PARALLEL`) |
 | `--ollama-keep-alive 1m` | wie lange das Modell nach der letzten Anfrage geladen bleibt |
 | `--ollama-grace-min 60` | so lange auf Ollama warten, bevor ausgewichen wird |
@@ -146,6 +152,7 @@ Ollama übersetzt standardmäßig **jede Einblendung in einer eigenen Anfrage** 
 | `--gpu-busy-percent 40` | ab dieser GPU-Auslastung als „Spiel läuft" werten |
 | `--min-size-mb 100` / `--min-age 180` | kleinere bzw. jüngere Dateien ignorieren |
 | `--log-file PFAD` | Log in Datei (max. 5 MB, 3 ältere Versionen) |
+| `--verbose` | ausführliches Log: jede nachübersetzte oder korrigierte Zeile |
 
 Alle Optionen: `python sub_translate.py --help`
 
@@ -164,4 +171,6 @@ Alle Optionen: `python sub_translate.py --help`
 | `übersprungen: kleiner als --min-size-mb` | kurze Episoden: `--min-size-mb 20` |
 | `Zielordner … nicht erreichbar` | Netzlaufwerk aus oder Laufwerksbuchstabe statt `\\SERVER\…` verwendet |
 | Häufig `übersetzt mit Azure` statt Ollama | Ollama läuft nicht (Autostart prüfen, `ollama ps`) |
+| `Ollama: HTTP 500 …, neuer Versuch` | Aussetzer von Ollama, z. B. zu wenig Grafikspeicher; wird automatisch wiederholt. Häuft es sich, `OLLAMA_NUM_PARALLEL` und `--ollama-parallel` verringern |
+| `… Zeilen, die Ollama nicht übersetzen konnte, übernimmt Azure` | einzelne Zeilen hat Ollama nicht geschafft, die ersten stehen in der Meldung; mehr Einzelheiten mit `--verbose` |
 | Umlaute im Log kaputt (`Ã¼`) | Anzeigeproblem: `Get-Content … -Encoding UTF8` |
