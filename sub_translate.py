@@ -155,6 +155,40 @@ LANG_NAMES = {
 }
 
 
+def _plain_len(t):
+    return len(re.sub(r"<[^>]+>|[\s%s]" % NOTES, "", t))
+
+
+def _norm(t):
+    return re.sub(r"[\W_]+", "", re.sub(r"<[^>]+>", "", t)).lower()
+
+
+def anchor_ok(echo, src):
+    """Hat das Modell den Anfang der richtigen Originalzeile abgeschrieben?"""
+    e, s_ = _norm(echo), _norm(src)
+    if not s_:
+        return True
+    if not e:
+        return False
+    k = min(len(e), len(s_), 10)
+    return k >= min(3, len(s_)) and s_.startswith(e[:k])
+
+
+def shifted(src, out):
+    """Erkennt verschobenen Text: Bei korrekter Übersetzung ist das Längenverhältnis
+    Deutsch/Original von Zeile zu Zeile ähnlich. Rutscht Text in die Nachbarzeile, wird eine
+    Zeile auffällig lang und die andere auffällig kurz. Vergleich mit dem Median des Abschnitts,
+    damit es für jede Ausgangssprache funktioniert (auch Chinesisch -> Deutsch)."""
+    ratios = [(_plain_len(o) / _plain_len(s_)) for s_, o in zip(src, out) if _plain_len(s_) >= 12]
+    if len(ratios) < 3:
+        return False
+    med = sorted(ratios)[len(ratios) // 2]
+    if med <= 0:
+        return False
+    odd = [r for r in ratios if r > med * 2.6 or r < med / 2.6]
+    return len(odd) >= 1
+
+
 class Ollama:
     """Lokales Sprachmodell über Ollama. Übersetzt mit Kontext der vorherigen Zeilen,
     mehrere Abschnitte gleichzeitig (Ollama braucht dafür OLLAMA_NUM_PARALLEL >= parallel)."""
@@ -215,11 +249,14 @@ class Ollama:
             f"You are a professional subtitle translator. Translate film subtitles from {lang} "
             "into natural, idiomatic German as used in professional German subtitles.\n"
             "Rules:\n"
-            "- 'lines' maps keys (l1, l2, ...) to subtitle lines. Return an object with exactly the same keys, "
-            "each holding the German translation of that line.\n"
-            "- Each key is shown on screen separately. If a sentence continues over several keys, "
-            "split the German sentence across the same keys. Never leave a key empty, never move text "
-            "to another key.\n"
+            "- 'lines' maps keys (l1, l2, ...) to subtitle lines. Return an object with exactly the same keys. "
+            "Each key holds an object with two fields: 'src' = the first three words of THAT key's original "
+            "line, copied exactly (for languages without spaces: its first 5 characters), and 'de' = the "
+            "German translation of THAT key's line.\n"
+            "- Each key is shown on screen at its own fixed time. Translate EVERY key on its own, "
+            "exactly what is said in that key. NEVER move words, names or meaning into a neighbouring key, "
+            "even if a sentence continues in the next key. An incomplete German fragment is fine and "
+            "expected in that case. Never leave a key empty.\n"
             "- Keep HTML tags like <i>...</i> and music symbols like ♪ where they are.\n"
             "- Keep line breaks inside an item if sensible; keep it short and readable.\n"
             "- 'context' only shows the previous lines for understanding; do not translate it.\n"
@@ -231,7 +268,9 @@ class Ollama:
         # das Modell kann also keine Zeilen zusammenlegen oder weglassen.
         schema = {
             "type": "object",
-            "properties": {k: {"type": "string"} for k in keys},
+            "properties": {k: {"type": "object",
+                               "properties": {"src": {"type": "string"}, "de": {"type": "string"}},
+                               "required": ["src", "de"], "additionalProperties": False} for k in keys},
             "required": keys,
             "additionalProperties": False,
         }
@@ -265,7 +304,8 @@ class Ollama:
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
         try:
             obj = json.loads(content)
-            out = [obj[k] for k in keys]
+            out = [obj[k]["de"] for k in keys]
+            echoes = [obj[k]["src"] for k in keys]
         except (json.JSONDecodeError, KeyError, TypeError):
             log.debug("    Ollama: Antwort nicht lesbar: %r", content[:300])
             return None
@@ -273,6 +313,13 @@ class Ollama:
             return None
         # Leere Übersetzung für eine Zeile mit Text = Modell hat Text verschoben -> neu fragen
         if any(not x.strip() and has_letters(src_line) for x, src_line in zip(out, lines)):
+            return None
+        bad = [] if len(lines) == 1 else [i for i, (e, s_) in enumerate(zip(echoes, lines)) if not anchor_ok(e, s_)]
+        if bad:
+            log.info("    Ollama: Zeile %d passt nicht zu ihrem Original (Text verschoben?), frage neu", bad[0] + 1)
+            return None
+        if len(lines) > 1 and shifted(lines, out):
+            log.info("    Ollama: Text scheint zwischen Einblendungen verschoben, frage neu")
             return None
         return out
 
@@ -858,6 +905,60 @@ def log_extract(video):
                  max(2, int(gb * 1024 / 50 / 60) + 1))
 
 
+def compare(video, prefer_sdh=False, ocr=None):
+    """Stellt Original und .de.srt Einblendung für Einblendung gegenüber (zur Kontrolle)."""
+    de_path = video.with_name(video.stem + ".de.srt")
+    if not de_path.exists():
+        raise SystemExit(f"Keine deutsche Untertiteldatei gefunden: {de_path}")
+    de = list(srt.parse(read_text_guess(de_path)))
+    with tempfile.TemporaryDirectory() as tmp:
+        src, lang = external_srt(video)
+        if src:
+            what = f"externe Datei {src.name}"
+            orig = list(srt.parse(read_text_guess(src)))
+        else:
+            streams = probe_subs(video)
+            track, lang, reason = pick_track(streams, prefer_sdh)
+            if track is not None:
+                what = f"Spur {track['index']} ({lang or 'unbekannt'})"
+                p = Path(tmp) / "src.srt"
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-map", f"0:{track['index']}",
+                                "-c:s", "srt", str(p)], check=True, creationflags=NO_WINDOW)
+                orig = list(srt.parse(read_text_guess(p)))
+            elif ocr and reason.startswith("nur Bild-Untertitel"):
+                img, lang = pick_image_track(streams, ocr, prefer_sdh)
+                what = f"Bild-Spur {img['index']} per OCR"
+                orig = ocr.run(video, img, lang, tmp)
+            else:
+                raise SystemExit(f"Keine Originalspur zum Vergleichen: {reason}")
+        all_tracks = [f"{s_['index']}: {lang_of_stream(s_) or '?'} {s_.get('codec_name')}"
+                      f"{' SDH' if is_sdh(s_) else ''}{' forced' if is_forced(s_) else ''}"
+                      for s_ in (probe_subs(video) if not src else [])]
+
+    def ts(t):
+        t = int(t.total_seconds() * 1000)
+        return f"{t // 3600000:02d}:{t // 60000 % 60:02d}:{t // 1000 % 60:02d},{t % 1000:03d}"
+
+    lines, bad_time = [], 0
+    for i in range(max(len(orig), len(de))):
+        o = orig[i] if i < len(orig) else None
+        d = de[i] if i < len(de) else None
+        same = o and d and o.start == d.start and o.end == d.end
+        bad_time += 0 if same else 1
+        lines.append(f"#{i + 1:<5} {ts(o.start) if o else '-':>12} {'' if same else '  <<< ZEIT ABWEICHEND ' + (ts(d.start) if d else '-')}")
+        lines.append(f"   ORIG: {(o.content if o else '-').replace(chr(10), ' / ')}")
+        lines.append(f"   DE:   {(d.content if d else '-').replace(chr(10), ' / ')}")
+    head = [f"Vergleich für {video.name}",
+            f"Quelle der Übersetzung (heute ausgewählt): {what}",
+            f"Untertitelspuren im Film: {', '.join(all_tracks) or '-'}",
+            f"Einblendungen Original: {len(orig)}, Deutsch: {len(de)}, abweichende Zeiten: {bad_time}",
+            "Hinweis: Stimmen alle Zeiten, aber der deutsche Text passt ab einer Stelle zur Nachbarzeile,",
+            "wurde Text verschoben -> .de.srt löschen und neu übersetzen lassen.", ""]
+    out = Path.cwd() / f"{video.stem}.vergleich.txt"
+    out.write_text("\n".join(head + lines) + "\n", encoding="utf-8-sig")
+    log.info("Vergleich geschrieben: %s (%d Einblendungen, %d mit abweichender Zeit)", out, len(orig), bad_time)
+
+
 def write_srt(target, subs):
     tmp_out = target.with_name(target.name + ".tmp")
     tmp_out.write_text(srt.compose(subs), encoding="utf-8")
@@ -1345,6 +1446,8 @@ def main():
                     help="deutsche Bild-Untertitel per OCR in eine .de.srt umwandeln (vermeidet Transcoding)")
     ap.add_argument("--tesseract", type=Path, default=None,
                     help="Pfad zu tesseract.exe (Standard: automatisch suchen)")
+    ap.add_argument("--compare", action="store_true",
+                    help="nur prüfen: Original und vorhandene .de.srt gegenüberstellen (Datei *.vergleich.txt)")
     ap.add_argument("--move-to", type=Path, default=None,
                     help="fertige Filme samt Untertiteln hierhin verschieben (z. B. Y:/Filme)")
     ap.add_argument("--move-skipped", action="store_true",
@@ -1433,6 +1536,12 @@ def main():
                          ", auch deutsche Bild-Untertitel -> .de.srt" if args.ocr_german else "")
                 if args.ocr_german and "deu" not in ocr.langs:
                     log.warning("--ocr-german gesetzt, aber das deutsche Tesseract-Paket (deu) fehlt.")
+
+    if args.compare:
+        if not args.folder.is_file():
+            raise SystemExit("--compare braucht den Pfad zu einer einzelnen Videodatei.")
+        compare(args.folder, args.prefer_sdh, ocr)
+        return
 
     mover = None
     if args.move_to:

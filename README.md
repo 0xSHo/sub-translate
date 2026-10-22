@@ -115,6 +115,16 @@ Startet versehentlich eine zweite Instanz, beendet sie sich selbst mit „Dauerb
 
 **Anderer Ordner:** Das Skript enthält keinen festen Pfad. Es reicht, `install_task.ps1` mit dem neuen `-Watch` erneut auszuführen und danach wie oben neu zu starten. Ist der Ordner beim Start noch nicht da (z. B. externes Laufwerk), wartet das Skript darauf.
 
+## Übersetzung prüfen
+
+```powershell
+.\venv\Scripts\python sub_translate.py "D:\Filme\Film.mkv" --compare --prefer-sdh
+```
+
+Schreibt `Film.vergleich.txt` ins aktuelle Verzeichnis: Original und Deutsch Einblendung für Einblendung, mit Zeitstempeln und Hinweis auf abweichende Zeiten. Damit lässt sich prüfen, ob die richtige Spur übersetzt wurde und ob jede deutsche Zeile zu ihrer Originalzeile passt. Bei `--compare` dieselben Spur-Optionen (`--prefer-sdh`) wie im Dauerbetrieb angeben.
+
+Ollama muss in jedem Feld zuerst den Anfang der Originalzeile abschreiben. So kann das Skript erkennen, wenn Text in eine Nachbarzeile gerutscht ist, und fragt den Abschnitt in diesem Fall neu an.
+
 ## Wichtige Optionen
 
 | Option | Bedeutung |
@@ -126,6 +136,7 @@ Startet versehentlich eine zweite Instanz, beendet sie sich selbst mit „Dauerb
 | `--ollama-keep-alive 1m` | wie lange das Modell nach der letzten Anfrage geladen bleibt |
 | `--ollama-grace-min 60` | so lange auf Ollama warten, bevor ausgewichen wird |
 | `--prefer-sdh` | SDH-Spur (mit ♪ und [Musik]) bevorzugen |
+| `--compare` | nur prüfen: Original und `.de.srt` gegenüberstellen |
 | `--move-to PFAD` | fertige Filme samt Untertiteln dorthin verschieben |
 | `--move-skipped` | auch nicht übersetzbare Filme verschieben |
 | `--ocr-german` | deutsche Bild-Untertitel per OCR in eine `.de.srt` umwandeln (vermeidet Transcoding in Jellyfin) |
