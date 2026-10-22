@@ -155,6 +155,24 @@ LANG_NAMES = {
 }
 
 
+def clean_single(text, src_line):
+    """Antwort im Einzelmodus säubern; None, wenn sie unbrauchbar aussieht."""
+    note = re.compile(r"^\s*[(*\[]?\s*(hinweis|anmerkung|erklärung|erläuterung|note|explanation|"
+                      r"übersetzung|translation|alternativ|alternative)\b", re.I)
+    t = re.sub(r"^(german|deutsch|übersetzung|translation)\s*:\s*", "", text.strip(), flags=re.I).strip()
+    # 1) Erklärungszeilen entfernen
+    t = "\n".join(l for l in t.splitlines() if l.strip() and not note.match(l)).strip()
+    # 2) umschließende Anführungszeichen entfernen, wenn das Original keine hat
+    for a, b in [('"', '"'), ("„", "“"), ("“", "”"), ("«", "»"), ("»", "«"), ("'", "'")]:
+        if len(t) > 2 and t.startswith(a) and t.endswith(b) and not src_line.strip().startswith(a):
+            t = t[len(a):-len(b)].strip()
+    lines = [l for l in t.splitlines() if l.strip()]
+    src_lines = max(1, len([l for l in src_line.splitlines() if l.strip()]))
+    if not lines or len(lines) > src_lines + 1:   # leer oder mit Erklärungen
+        return None
+    return "\n".join(lines)
+
+
 def _plain_len(t):
     return len(re.sub(r"<[^>]+>|[\s%s]" % NOTES, "", t))
 
@@ -206,6 +224,9 @@ class Ollama:
         self.url = self.base + "/api/chat"
         self.parallel = max(1, parallel)
         self.batch = max(1, batch)
+        # Im Einzelmodus sind die Anfragen klein: weniger Kontext pro Anfrage spart Grafikspeicher und
+        # erlaubt mehr parallele Anfragen. Für alle Anfragen gleich halten, sonst lädt Ollama das Modell neu.
+        self.num_ctx = 2048 if self.batch == 1 else 4096
         self.grace = grace_min * 60
         self.down_since = None
         self.name = f"Ollama ({model})"
@@ -246,7 +267,49 @@ class Ollama:
         self.retries = 0
         self.started = time.time()
 
+    def _post(self, body):
+        try:
+            r = requests.post(self.url, json=body, timeout=600)
+        except requests.RequestException as e:
+            self.mark_down()
+            raise OllamaDown(f"Ollama nicht erreichbar ({e.__class__.__name__}). Läuft Ollama?")
+        if r.status_code == 404:
+            raise Unsupported(f"Modell fehlt, einmal ausführen: ollama pull {self.model}")
+        if r.status_code >= 400:
+            raise Unsupported(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
+        content = r.json().get("message", {}).get("content", "")
+        return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+
+    def _ask_single(self, line, src, context, after):
+        """Eine Einblendung, Antwort als reiner Text (ohne JSON): deutlich weniger zu schreiben,
+        daher schneller. Verrutschen ist unmöglich, weil es nur diese eine Zeile gibt."""
+        lang = LANG_NAMES.get(src, "the source language")
+        system = (
+            f"You translate film subtitles from {lang} into natural, idiomatic German as used in "
+            "professional German subtitles. You get ONE subtitle line plus neighbouring lines for context. "
+            "Translate ONLY that one line, exactly what is said in it; never add content from the context "
+            "lines (an incomplete German fragment is fine if the sentence continues). Keep HTML tags like "
+            "<i>...</i>, music symbols like ♪ and line breaks. Reply with the German translation only: "
+            "no quotes, no notes, no explanations."
+        )
+        parts = []
+        if context:
+            parts.append("Previous lines (context, do not translate):\n" + "\n".join(f"- {c}" for c in context))
+        parts.append("LINE TO TRANSLATE:\n" + line)
+        if after:
+            parts.append("Next lines (context, do not translate):\n" + "\n".join(f"- {c}" for c in after))
+        body = {
+            "model": self.model, "stream": False, "keep_alive": self.keep_alive,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}],
+            "options": {"temperature": 0.2, "num_ctx": self.num_ctx,
+                        "num_predict": min(400, 40 + 2 * len(line))},
+        }
+        return clean_single(self._post(body), line)
+
     def _ask(self, lines, src, context, after=()):
+        if len(lines) == 1:
+            out = self._ask_single(lines[0], src, context, after)
+            return [out] if out else None
         lang = LANG_NAMES.get(src, "the source language (detect it)")
         system = (
             f"You are a professional subtitle translator. Translate film subtitles from {lang} "
@@ -290,7 +353,7 @@ class Ollama:
             # endlos Leerzeichen erzeugt (bekanntes Problem, kostet sonst Minuten pro Abschnitt)
             # 4096 Token reichen für 25 Zeilen samt Antwort locker und sparen Grafikspeicher,
             # der bei parallelen Anfragen pro Anfrage reserviert wird
-            "options": {"temperature": 0.2, "num_ctx": 4096,
+            "options": {"temperature": 0.2, "num_ctx": self.num_ctx,
                         "num_predict": min(4000, 200 + 2 * sum(len(l) for l in lines) + 20 * len(lines))},
         }
         try:
