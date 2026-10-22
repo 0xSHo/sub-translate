@@ -310,6 +310,8 @@ class Ollama:
         self.down_since = None
         self.name = f"Ollama ({model})"
         self._lock = threading.Lock()
+        self.retries = self.short = self.done = self.total = 0
+        self.started = time.time()
         self.start_file()
 
     # --- Erreichbarkeit -------------------------------------------------
@@ -344,6 +346,7 @@ class Ollama:
         self.total = total
         self.done = 0
         self.retries = 0
+        self.short = 0
         self.started = time.time()
 
     def _post(self, body):
@@ -407,9 +410,10 @@ class Ollama:
             "into natural, idiomatic German as used in professional German subtitles.\n"
             "Rules:\n"
             "- 'lines' maps keys (l1, l2, ...) to subtitle lines. Return an object with exactly the same keys. "
-            "Each key holds an object with two fields: 'src' = the first three words of THAT key's line "
-            "copied character by character in the ORIGINAL language (do NOT translate 'src'; for languages "
-            "without spaces: its first 5 characters), and 'de' = the German translation of THAT key's line.\n"
+            "Each key holds an object with two fields: first 'de' = the German translation of THAT key's "
+            "WHOLE line, from its first to its last word; then 'src' = the first three words of THAT key's "
+            "line copied character by character in the ORIGINAL language (only a check mark, it does not "
+            "limit 'de'; do NOT translate 'src'; for languages without spaces: its first 5 characters).\n"
             "- Each key is shown on screen at its own fixed time. Translate by meaning, in natural spoken "
             "German (du/Sie fitting the situation). If a sentence runs over several keys, distribute the German "
             "sentence naturally over exactly those keys (German word order may shift words between them), "
@@ -429,8 +433,8 @@ class Ollama:
         schema = {
             "type": "object",
             "properties": {k: {"type": "object",
-                               "properties": {"src": {"type": "string"}, "de": {"type": "string"}},
-                               "required": ["src", "de"], "additionalProperties": False} for k in keys},
+                               "properties": {"de": {"type": "string"}, "src": {"type": "string"}},
+                               "required": ["de", "src"], "additionalProperties": False} for k in keys},
             "required": keys,
             "additionalProperties": False,
         }
@@ -485,11 +489,12 @@ class Ollama:
             log.info("    Ollama: Länge auffällig, Text evtl. verschoben, frage neu (%r -> %r)",
                      odd[0][:40], odd[1][:40])
             return None
-        # Bei einer Einzelzeile lieber eine knappe Übersetzung behalten als gar keine
+        # Nur zur Kontrolle im Log, ohne Neuanfrage (eine Neuanfrage liefert meist dieselbe Antwort)
         prob = sentence_problem(lines, out, src, context[-1] if context else None) if len(lines) > 1 else None
         if prob:
-            log.info("    Ollama: Satz unvollständig übersetzt, frage neu (%r -> %r)", prob[0][:50], prob[1][:50])
-            return None
+            with self._lock:
+                self.short += 1
+            log.debug("    Ollama: Satz evtl. unvollständig (%r -> %r)", prob[0][:50], prob[1][:50])
         return out
 
     def _translate_chunk(self, lines, src, context, after=()):
@@ -541,6 +546,8 @@ class Ollama:
             out = []
             for f in futures:
                 out += f.result()  # Reihenfolge bleibt erhalten
+            if self.batch > 1:
+                log.info("    Ollama: Neuanfragen %d, Sätze evtl. unvollständig %d", self.retries, self.short)
             return out
         except BaseException:
             pool.shutdown(wait=False, cancel_futures=True)
