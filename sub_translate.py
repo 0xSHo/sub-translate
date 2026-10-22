@@ -203,8 +203,12 @@ def shifted(src, out):
     med = sorted(ratios)[len(ratios) // 2]
     if med <= 0:
         return False
-    odd = [r for r in ratios if r > med * 2.6 or r < med / 2.6]
-    return len(odd) >= 1
+    for s_, o in zip(src, out):
+        if _plain_len(s_) >= 12:
+            r = _plain_len(o) / _plain_len(s_)
+            if r > med * 2.6 or r < med / 2.6:
+                return (s_, o)   # auffälliges Paar (für die Meldung)
+    return None
 
 
 class Ollama:
@@ -316,9 +320,9 @@ class Ollama:
             "into natural, idiomatic German as used in professional German subtitles.\n"
             "Rules:\n"
             "- 'lines' maps keys (l1, l2, ...) to subtitle lines. Return an object with exactly the same keys. "
-            "Each key holds an object with two fields: 'src' = the first three words of THAT key's original "
-            "line, copied exactly (for languages without spaces: its first 5 characters), and 'de' = the "
-            "German translation of THAT key's line.\n"
+            "Each key holds an object with two fields: 'src' = the first three words of THAT key's line "
+            "copied character by character in the ORIGINAL language (do NOT translate 'src'; for languages "
+            "without spaces: its first 5 characters), and 'de' = the German translation of THAT key's line.\n"
             "- Each key is shown on screen at its own fixed time. Translate EVERY key on its own, "
             "exactly what is said in that key. NEVER move words, names or meaning into a neighbouring key, "
             "even if a sentence continues in the next key. An incomplete German fragment is fine and "
@@ -384,10 +388,14 @@ class Ollama:
             return None
         bad = [] if len(lines) == 1 else [i for i, (e, s_) in enumerate(zip(echoes, lines)) if not anchor_ok(e, s_)]
         if bad:
-            log.info("    Ollama: Zeile %d passt nicht zu ihrem Original (Text verschoben?), frage neu", bad[0] + 1)
+            i = bad[0]
+            log.info("    Ollama: Zeile %d passt nicht zu ihrem Original, frage neu (erwartet %r, geliefert %r)",
+                     i + 1, lines[i][:30], echoes[i][:30])
             return None
-        if len(lines) > 1 and shifted(lines, out):
-            log.info("    Ollama: Text scheint zwischen Einblendungen verschoben, frage neu")
+        odd = shifted(lines, out) if len(lines) > 1 else None
+        if odd:
+            log.info("    Ollama: Länge auffällig, Text evtl. verschoben, frage neu (%r -> %r)",
+                     odd[0][:40], odd[1][:40])
             return None
         return out
 
@@ -1036,7 +1044,7 @@ def compare(video, prefer_sdh=False, ocr=None):
             f"Einblendungen Original: {len(orig)}, Deutsch: {len(de)}, abweichende Zeiten: {bad_time}",
             "Hinweis: Stimmen alle Zeiten, aber der deutsche Text passt ab einer Stelle zur Nachbarzeile,",
             "wurde Text verschoben -> .de.srt löschen und neu übersetzen lassen.", ""]
-    out = Path.cwd() / f"{video.stem}.vergleich.txt"
+    out = Path(__file__).resolve().parent / f"{video.stem}.vergleich.txt"
     out.write_text("\n".join(head + lines) + "\n", encoding="utf-8-sig")
     log.info("Vergleich geschrieben: %s (%d Einblendungen, %d mit abweichender Zeit)", out, len(orig), bad_time)
 
